@@ -13,18 +13,21 @@ import { createContext, useContext } from 'react'
 import type { ReactNode } from 'react'
 import {
   TASK_BOARD_CARD_DECORATION,
+  TASK_BOARD_CREATE_SECTION,
   TASK_BOARD_DETAIL_SECTION,
   TASK_BOARD_SETTINGS_SECTION,
   type TaskBoardCardDecorationProps,
+  type TaskBoardCreateSectionProps,
   type TaskBoardDetailSectionProps,
   type TaskBoardSettingsSectionProps,
 } from '../core/extension.ts'
 
-/** The three provider seats, adapted to plain render functions. */
+/** The provider seats, adapted to plain render functions. */
 export interface TaskBoardSeats {
   detailSection: (props: TaskBoardDetailSectionProps) => ReactNode
   settingsSection: (props: TaskBoardSettingsSectionProps) => ReactNode
   cardDecoration: (props: TaskBoardCardDecorationProps) => ReactNode
+  createSection: (props: TaskBoardCreateSectionProps) => ReactNode
 }
 
 /** Nothing registered: every seat renders empty. */
@@ -32,6 +35,7 @@ export const EMPTY_TASK_BOARD_SEATS: TaskBoardSeats = {
   detailSection: () => null,
   settingsSection: () => null,
   cardDecoration: () => null,
+  createSection: () => null,
 }
 
 /** The framework `renderSlot` binding shape (key + owner props share). */
@@ -44,6 +48,7 @@ export function seatsFromRenderSlot(renderSlot: SlotRenderBinding | undefined): 
     detailSection: props => renderSlot(TASK_BOARD_DETAIL_SECTION, props as unknown as Record<string, unknown>),
     settingsSection: props => renderSlot(TASK_BOARD_SETTINGS_SECTION, props as unknown as Record<string, unknown>),
     cardDecoration: props => renderSlot(TASK_BOARD_CARD_DECORATION, props as unknown as Record<string, unknown>),
+    createSection: props => renderSlot(TASK_BOARD_CREATE_SECTION, props as unknown as Record<string, unknown>),
   }
 }
 

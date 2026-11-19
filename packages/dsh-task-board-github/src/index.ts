@@ -21,6 +21,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { resolveTaskBoardHostFace } from './core/contract.ts'
 import { GITHUB_PROXY_MODES, type GitHubProxyMode } from './core/setup.ts'
+import type { GitHubProjectConfig, GitHubProjectOwnerType, GitHubProjectStatusMap } from './core/types.ts'
 import { GITHUB_API_BASE_URL } from './host/client.ts'
 import { resolveProxyConfiguration } from './host/proxy.ts'
 import { createLlmIssueAnalyzer } from './host/analysis.ts'
@@ -52,10 +53,12 @@ export type DraftPrPolicy = (typeof DRAFT_PR_POLICIES)[number]
 /** Order of this extension's announcement section, just after the board's. */
 const SECTION_ORDER = EXTENSION_TOOL_SECTION_ORDER
 
-/** The nine agent-tool names this extension's announcement describes. */
+/** The eleven agent-tool names this extension's announcement describes. */
 const GITHUB_TOOL_NAMES = [
   'task_board_github_setup',
   'task_board_github_repositories',
+  'task_board_github_projects',
+  'task_board_github_create',
   'task_board_github_list',
   'task_board_github_get',
   'task_board_github_refresh',
@@ -69,7 +72,7 @@ const GITHUB_TOOL_NAMES = [
  * Model-facing announcement: what the extension does, what it never does with
  * remote text, and the words that name it.
  */
-export const GITHUB_GUIDANCE = '本机已安装 dsh-task-board-github 扩展（DSH Web GUI 任务看板的 GitHub Issues 提供方）：把带包含标签的 GitHub issue 同步为看板卡片，并把卡片的列变化写回 issue 上由本扩展管理的标签；另注册 task_board_github_* agent 工具（list/get/refresh/create_pr/link_pr/comment/close_issue），随看板总开关与本扩展开关一起收放。GitHub 凭据只在宿主进程从环境变量读取，绝不进入浏览器、设置卡或模型可见载荷；远端 issue 文本只作为卡片内容，绝不进入 promptPrefix、权限或工作区身份。用户提到「GitHub 任务 / GitHub issue / 同步 GitHub / 关联 PR / 创建 PR」时即指本扩展，请据此协作。'
+export const GITHUB_GUIDANCE = '本机已安装 dsh-task-board-github 扩展（DSH Web GUI 任务看板的 GitHub Issues 与 Projects v2 提供方）：把带包含标签或指派的 GitHub issue 以及 GitHub Project v2（Issue 与 DraftIssue）同步为看板卡片，并把卡片的列变化写回 issue 标签或 Project Status 列；另注册 task_board_github_* agent 工具（setup/repositories/projects/create/list/get/refresh/create_pr/link_pr/comment/close_issue），随看板总开关与本扩展开关一起收放。GitHub 凭据只在宿主进程从环境变量或凭据存储读取，绝不进入浏览器、设置卡或模型可见载荷；远端 issue 文本只作为卡片内容，绝不进入 promptPrefix、权限或工作区身份。用户提到「GitHub 任务 / GitHub issue / GitHub Project / 同步 GitHub / 关联 PR / 创建 PR」时即指本扩展，请据此协作。'
 
 /** GitHub labels one repository maps onto the board columns. */
 export interface GitHubStateLabels {
@@ -138,6 +141,10 @@ export interface Config {
   tokenEnv?: Volatile<string>
   /** Repositories configured for GitHub Issues synchronization. */
   repositories?: Volatile<GitHubRepoConfig[]>
+  /** GitHub Projects v2 configured for synchronization. */
+  projects?: Volatile<GitHubProjectConfig[]>
+  /** Optional GitHub OAuth App client id override for Device Flow. */
+  oauthClientId?: Volatile<string>
   /**
    * How this integration reaches GitHub: `auto` follows the conventional proxy
    * variables and then the operating system's own proxy, `custom` pins
@@ -162,6 +169,10 @@ export interface ConfigInput {
   tokenEnv?: string
   /** Repositories configured for GitHub Issues synchronization. */
   repositories?: GitHubRepoConfigInput[]
+  /** GitHub Projects v2 configured for synchronization. */
+  projects?: GitHubProjectConfigInput[]
+  /** Optional GitHub OAuth App client id override for Device Flow. */
+  oauthClientId?: string
   /** Proxy mode: `auto` (default), `custom` or `direct`. */
   proxyMode?: GitHubProxyMode
   /** Custom proxy URL; only the `custom` mode reads it. */
@@ -228,11 +239,43 @@ const GitHubRepoConfigSchema = z.object({
   analysisModel: z.string().default(''),
 })
 
+/** One Project v2 as a profile patch declares it. */
+export interface GitHubProjectConfigInput {
+  ownerType?: GitHubProjectOwnerType
+  owner: string
+  projectNumber: number
+  title?: string
+  pollingIntervalMs?: number
+  statusMap?: Partial<GitHubProjectStatusMap>
+  includeDrafts?: boolean
+  analysisModel?: string
+}
+
+/** One configured GitHub Project v2, as the profile patch declares it. */
+const GitHubProjectConfigSchema = z.object({
+  ownerType: z.union(['organization', 'user'] as const).default('organization'),
+  owner: z.string(),
+  projectNumber: z.number(),
+  title: z.string().default(''),
+  pollingIntervalMs: z.number().default(300_000),
+  statusMap: z.object({
+    backlog: z.string().default('Backlog'),
+    todo: z.string().default('Todo'),
+    running: z.string().default('In Progress'),
+    done: z.string().default('Done'),
+    failed: z.string().default('Blocked'),
+  }),
+  includeDrafts: z.boolean().default(true),
+  analysisModel: z.string().default(''),
+})
+
 export const Config: z<ConfigInput, Config> = z.object({
   enabled: z.boolean().default(true).volatile(),
   announceToAgent: z.boolean().default(false).volatile(),
   tokenEnv: z.string().default(DEFAULT_TOKEN_ENV).volatile(),
   repositories: z.array(GitHubRepoConfigSchema).default([]).volatile(),
+  projects: z.array(GitHubProjectConfigSchema).default([]).volatile(),
+  oauthClientId: z.string().default('').volatile(),
   // `auto` is the default because it is the mode that is right without being
   // configured: on a host whose egress runs through a proxy that no environment
   // variable names, this is the difference between a working integration and a
@@ -254,6 +297,10 @@ export interface GitHubProviderSettings {
   tokenEnv: string
   /** Repositories to synchronize. */
   repositories: readonly GitHubRepoConfig[]
+  /** Projects v2 to synchronize. */
+  projects: readonly GitHubProjectConfig[]
+  /** Optional OAuth App client id override. */
+  oauthClientId: string
   /** How this integration reaches GitHub. */
   proxyMode: GitHubProxyMode
   /** Custom proxy URL; read only by the `custom` mode. */
@@ -290,6 +337,8 @@ export function resolveProviderSettings(config?: Config): GitHubProviderSettings
     announceToAgent: readConfigField(config?.announceToAgent, DEFAULT_ANNOUNCE_TO_AGENT),
     tokenEnv: readConfigField(config?.tokenEnv, DEFAULT_TOKEN_ENV),
     repositories: readConfigField<GitHubRepoConfig[]>(config?.repositories, []),
+    projects: readConfigField<GitHubProjectConfig[]>(config?.projects, []),
+    oauthClientId: readConfigField(config?.oauthClientId, ''),
     proxyMode: readConfigField<GitHubProxyMode>(config?.proxyMode, 'auto'),
     proxyUrl: readConfigField(config?.proxyUrl, ''),
   }
@@ -452,10 +501,18 @@ function applyImpl(ctx: Context, config?: Config): void {
   const setup = createGitHubSetup({
     ctx,
     repositories: () => settings().repositories,
+    projects: () => settings().projects,
+    oauthClientId: () => settings().oauthClientId,
     tokenEnv: () => settings().tokenEnv,
     proxyMode: () => settings().proxyMode,
     proxyUrl: () => settings().proxyUrl,
     running: () => providerLive,
+    workspaceRegistry: () => probeWorkspaceRegistry(ctx),
+    triggerSync: async () => {
+      if (liveService !== undefined) {
+        await liveService.syncAll()
+      }
+    },
     // Health of the provider THIS process mounted, read live: the status route
     // is how an operator tells a configured integration that has stopped
     // syncing from one that is merely quiet, and a snapshot taken at mount
@@ -525,7 +582,13 @@ function applyImpl(ctx: Context, config?: Config): void {
     // transport when the service is built, so a mode or URL edit that did not
     // remount would be stored and then ignored by every request until the next
     // restart.
-    const desired = JSON.stringify({ tokenEnv: next.tokenEnv, repositories: next.repositories, proxyMode: next.proxyMode, proxyUrl: next.proxyUrl })
+    const desired = JSON.stringify({
+      tokenEnv: next.tokenEnv,
+      repositories: next.repositories,
+      projects: next.projects,
+      proxyMode: next.proxyMode,
+      proxyUrl: next.proxyUrl,
+    })
     if (desired === mounted) return
     teardownProvider()
     token = resolved
@@ -547,6 +610,7 @@ function applyImpl(ctx: Context, config?: Config): void {
         providerLive = true
         const dispose = face.registerExtension(createGitHubExtension({
           repositories: next.repositories.map(repository => ({ ...repository })),
+          projects: next.projects.map(project => ({ ...project })),
           token,
           tokenEnv: next.tokenEnv,
           enabled: () => settings().enabled,
@@ -587,6 +651,8 @@ function applyImpl(ctx: Context, config?: Config): void {
   // A credential stored elsewhere — the settings card, a tool, the Models page
   // or a hand-edited store — reaches the next request without a row reload.
   ctx.on('credentials/reference-updated', () => { requestSync() })
+  // Logging in via dsh-connectors emits credentials/record-updated; reload immediately.
+  ctx.on('credentials/record-updated' as never, () => { requestSync() })
 
   // The setup routes need a web server. A deployment without one keeps the
   // provider, its polling and its tools, and loses only the configuration API

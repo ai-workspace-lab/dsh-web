@@ -2,8 +2,10 @@
  * New-task modal: title + description + the prompt that execution will send.
  * Creates through the Host and closes only after the Host confirms it.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { BoardController } from '../../core/controller.ts'
+import type { TaskBoardCreateBackendSelection, TaskBoardExtensionActionRequest, TaskBoardExtensionPayload } from '../../core/extension.ts'
+import { useTaskBoardSeats } from '../seats.tsx'
 import { resolveCardTargets, type CardTargetSource } from '../../core/card-defaults.ts'
 import { isValidCron, nextRunAtMs } from '../../core/schedule.ts'
 import { parseFreezeRequest } from '../../core/freeze-snapshot.ts'
@@ -124,6 +126,12 @@ export function NewTaskModal({ controller, onClose, initialTask, defaultWorkspac
   const [archiveOriginal, setArchiveOriginal] = useState(true)
   const [error, setError] = useState<string | undefined>(undefined)
   const [pending, setPending] = useState(false)
+  const seats = useTaskBoardSeats()
+  const [createBackend, setCreateBackend] = useState<TaskBoardCreateBackendSelection | undefined>(undefined)
+  const dispatch = useCallback(
+    (request: TaskBoardExtensionActionRequest) => controller.dispatchExtension(request),
+    [controller],
+  )
   const [options, setOptions] = useState(controller.getSnapshot().executionOptions)
   // "Parse pasted text" (issue #1540) exists only when the deployment carries a
   // parse face; the section stays hidden otherwise.
@@ -241,6 +249,10 @@ export function NewTaskModal({ controller, onClose, initialTask, defaultWorkspac
     // Blank rows never reach the wire: the protocol rejects a tag with an
     // empty name, and an empty list is expressed by omitting the field.
     const tagList = cleanTags(tags)
+    if (createBackend !== undefined && title.trim() === '') {
+      setError(t('new.required'))
+      return
+    }
     setPending(true)
     // The staged files are uploaded NOW, because the card is being saved: the
     // upload is what turns a local file into a stored object the card can
@@ -260,10 +272,32 @@ export function NewTaskModal({ controller, onClose, initialTask, defaultWorkspac
         return
       }
     }
+    let effectivePrompt = prompt
+    let effectiveWorkspaceId = workspaceId
+    let integrations: Record<string, TaskBoardExtensionPayload> | undefined
+    if (createBackend !== undefined) {
+      try {
+        const prepared = await createBackend.prepareCreate({
+          title: title.trim(),
+          description: description.trim(),
+          prompt: prompt.trim(),
+          tags: tagList.map(tag => tag.name),
+          ...(workspaceId === '' ? {} : { workspaceId }),
+        })
+        if (prompt.trim() === '' && prepared.prompt !== undefined) effectivePrompt = prepared.prompt
+        if (workspaceId === '' && prepared.workspaceId !== undefined) effectiveWorkspaceId = prepared.workspaceId
+        integrations = { [createBackend.extensionId]: prepared.payload }
+      } catch (backendError) {
+        const message = backendError instanceof Error ? backendError.message : String(backendError)
+        setPending(false)
+        setError(message)
+        return
+      }
+    }
     const task = await controller.createTaskConfirmed({
       title,
       description,
-      prompt,
+      prompt: effectivePrompt,
       ...(parentTask === undefined ? {} : { parentId: parentTask.id }),
       freeze,
       handover,
@@ -271,13 +305,14 @@ export function NewTaskModal({ controller, onClose, initialTask, defaultWorkspac
       // how "no pin, resolved at run time" is stored, so blanking a field the
       // dialog opened prefilled really unpins it. This dialog never sends
       // `applyCardDefaults` — the prefill above is the whole feature here.
-      ...(workspaceId === '' ? {} : { workspaceId }),
+      ...(effectiveWorkspaceId === '' ? {} : { workspaceId: effectiveWorkspaceId }),
       ...(mode === '' ? {} : { mode }),
       ...(permission === '' ? {} : { permission: permission as TaskPermission }),
       ...(model === '' ? {} : { model }),
       ...(reasoningEffort === '' ? {} : { reasoningEffort }),
       ...(reuseSession ? { reuseSession: true } : {}),
       ...(tagList.length > 0 ? { tags: tagList } : {}),
+      ...(integrations === undefined ? {} : { integrations }),
       ...(attachments.persisted.length + uploaded.length > 0
         // The storage is content-addressed: the same content uploaded twice
         // answers with one identifier, and the card may claim it once.
@@ -501,6 +536,18 @@ export function NewTaskModal({ controller, onClose, initialTask, defaultWorkspac
           </label>
         )}
       </CollapsibleSection>
+
+      {seats.createSection({
+        title,
+        description,
+        prompt,
+        tags: cleanTags(tags).map(tag => tag.name),
+        workspaceId,
+        pending,
+        selected: createBackend,
+        onSelect: setCreateBackend,
+        dispatch,
+      })}
 
       <CollapsibleSection title={t('new.section.labels')} summary={labelsSummary}>
         <TaskTagFields tags={tags} knownTags={collectKnownTags(controller.getSnapshot().tasks)} onChange={setTags} />

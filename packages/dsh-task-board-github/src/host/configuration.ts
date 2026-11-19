@@ -19,7 +19,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { GITHUB_ENTRY_IDS, type GitHubProxySettings } from '../core/setup.ts'
-import type { GitHubRepoConfig } from '../core/types.ts'
+import type { GitHubProjectConfig, GitHubRepoConfig } from '../core/types.ts'
 
 /** One entry the settings surface reports. */
 interface SettingsDescriptor {
@@ -81,6 +81,15 @@ export function findGitHubSettingsEntry(face: SettingsFace): { ns: string; revis
   return undefined
 }
 
+async function mutateGitHubSetting(ctx: Context, ops: readonly SettingsPathOp[], targetDescription: string): Promise<void> {
+  const face = resolveSettingsFace(ctx)
+  if (face === undefined) throw new Error(`this deployment serves no settings surface, so ${targetDescription} cannot be written`)
+  if (face.writable === false) throw new Error('this deployment serves configuration read-only')
+  const entry = findGitHubSettingsEntry(face)
+  if (entry === undefined) throw new Error('this deployment exposes no settings form for the GitHub extension')
+  await face.mutate(entry.ns, ops, entry.revision)
+}
+
 /**
  * Replace the configured repository list.
  *
@@ -93,12 +102,16 @@ export function findGitHubSettingsEntry(face: SettingsFace): { ns: string; revis
  *   the surface refuses the write.
  */
 export async function writeConfiguredRepositories(ctx: Context, repositories: readonly GitHubRepoConfig[]): Promise<void> {
-  const face = resolveSettingsFace(ctx)
-  if (face === undefined) throw new Error('this deployment serves no settings surface, so the repository list cannot be written')
-  if (face.writable === false) throw new Error('this deployment serves configuration read-only')
-  const entry = findGitHubSettingsEntry(face)
-  if (entry === undefined) throw new Error('this deployment exposes no settings form for the GitHub extension')
-  await face.mutate(entry.ns, [{ op: 'set', path: ['repositories'], value: repositories }], entry.revision)
+  await mutateGitHubSetting(ctx, [{ op: 'set', path: ['repositories'], value: repositories }], 'the repository list')
+}
+
+/**
+ * Replace the configured Project v2 list.
+ * @param ctx - host context.
+ * @param projects - the sanitized Project v2 list to store.
+ */
+export async function writeConfiguredProjects(ctx: Context, projects: readonly GitHubProjectConfig[]): Promise<void> {
+  await mutateGitHubSetting(ctx, [{ op: 'set', path: ['projects'], value: projects }], 'the project list')
 }
 
 /**
@@ -116,13 +129,8 @@ export async function writeConfiguredRepositories(ctx: Context, repositories: re
  *   the surface refuses the write.
  */
 export async function writeProxySettings(ctx: Context, settings: GitHubProxySettings): Promise<void> {
-  const face = resolveSettingsFace(ctx)
-  if (face === undefined) throw new Error('this deployment serves no settings surface, so the proxy settings cannot be written')
-  if (face.writable === false) throw new Error('this deployment serves configuration read-only')
-  const entry = findGitHubSettingsEntry(face)
-  if (entry === undefined) throw new Error('this deployment exposes no settings form for the GitHub extension')
-  await face.mutate(entry.ns, [
+  await mutateGitHubSetting(ctx, [
     { op: 'set', path: ['proxyMode'], value: settings.mode },
     { op: 'set', path: ['proxyUrl'], value: settings.url },
-  ], entry.revision)
+  ], 'the proxy settings')
 }

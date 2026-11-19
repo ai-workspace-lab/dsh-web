@@ -29,4 +29,35 @@ describe('GitHub source grouping', () => {
     expect(gitHubSourceGroup(local)).toBeUndefined()
     expect(gitHubSourceGroup(malformed)).toBeUndefined()
   })
+
+  it('operator sees a Project v2 group when metadata.project is present', () => {
+    // Given a linked card belonging to an org Project v2
+    const task = plainTask('proj', {
+      integrations: {
+        github: {
+          provider: 'github',
+          owner: 'DeepSeek-AI',
+          repository: 'dsh-web',
+          issueNumber: 12,
+          issueUrl: 'https://github.com/DeepSeek-AI/dsh-web/issues/12',
+          remoteLabels: [],
+          project: {
+            projectId: 'PVT_1',
+            projectNumber: 7,
+            ownerType: 'organization',
+            owner: 'DeepSeek-AI',
+            projectTitle: 'Q4 Roadmap',
+            itemId: 'PVTI_1',
+          },
+        },
+      },
+    })
+
+    // When the selector reads the card
+    // Then it groups under the Project v2 id and title
+    expect(gitHubSourceGroup(task)).toEqual({
+      id: 'github-project:deepseek-ai#7',
+      label: 'DeepSeek-AI / Q4 Roadmap',
+    })
+  })
 })

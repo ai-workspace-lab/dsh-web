@@ -28,6 +28,7 @@ import { mountPlugin, recordingClientFace, recordingSlots, settle } from './supp
 const SEAT_NAMES = [
   'task-board.detail.section',
   'task-board.card.decoration',
+  'task-board.create.section',
 ]
 
 /** The repository slugs the running provider publishes in its summary. */
@@ -145,9 +146,9 @@ describe('GitHub host wiring against a late board service', () => {
     const unprovide = root.provide('taskBoard', board.hostFace() as never)
     await settle()
 
-    // Then the provider is admitted with its nine tools and its published summary
+    // Then the provider is admitted with its eleven tools and its published summary
     expect(board.isActive('github')).toBe(true)
-    expect(board.toolNames).toHaveLength(9)
+    expect(board.toolNames).toHaveLength(11)
     expect(Object.keys(board.published)).toEqual(['github'])
 
     // When the board withdraws the service
@@ -173,7 +174,7 @@ describe('GitHub host wiring against a late board service', () => {
 
     // Then the provider is admitted without waiting for anything else
     expect(board.isActive('github')).toBe(true)
-    expect(board.toolNames).toHaveLength(9)
+    expect(board.toolNames).toHaveLength(11)
     await mounted.dispose()
   })
 

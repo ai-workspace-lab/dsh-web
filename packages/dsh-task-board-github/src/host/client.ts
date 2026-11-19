@@ -9,7 +9,18 @@
  * @module dsh-task-board-github/host/client
  */
 
-import type { GitHubCommentPayload, GitHubIssuePayload, GitHubPullRequestPayload } from '../core/types.ts'
+import type {
+  GitHubCommentPayload,
+  GitHubIssuePayload,
+  GitHubOrganizationSummary,
+  GitHubProjectDetailPayload,
+  GitHubProjectItemPayload,
+  GitHubProjectOwnerType,
+  GitHubProjectStatusOption,
+  GitHubPullRequestPayload,
+  GitHubRemoteProjectSummary,
+  GitHubRemoteRepositorySummary,
+} from '../core/types.ts'
 import { createProxyFetch, resolveProxyUrl, type ProxyConfiguration } from './proxy.ts'
 
 /**
@@ -302,14 +313,14 @@ export class GitHubApiClient {
     }
   }
 
-  private async request<T>(
+  private async requestWithResponse<T>(
     endpoint: string,
     options: {
       method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
       body?: unknown
       headers?: Record<string, string>
     } = {},
-  ): Promise<T> {
+  ): Promise<{ data: T; response: Response }> {
     const url = `${this.baseUrl}${endpoint.startsWith('/') ? '' : '/'}${endpoint}`
     const token = this.getToken()
     const headers: Record<string, string> = {
@@ -346,9 +357,21 @@ export class GitHubApiClient {
     }
 
     if (response.status === 204) {
-      return undefined as T
+      return { data: undefined as T, response }
     }
-    return (await response.json()) as T
+    return { data: (await response.json()) as T, response }
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: {
+      method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
+      body?: unknown
+      headers?: Record<string, string>
+    } = {},
+  ): Promise<T> {
+    const { data } = await this.requestWithResponse<T>(endpoint, options)
+    return data
   }
 
   /**
@@ -459,6 +482,361 @@ export class GitHubApiClient {
     return await this.request<{ login: string; name?: string | null }>('/user')
   }
 
+  /**
+   * Identify the authenticated account along with the OAuth scopes reported
+   * in the `x-oauth-scopes` response header.
+   */
+  async getAuthenticatedUserWithScopes(): Promise<{ login: string; name?: string | null; scopes: string[] }> {
+    const { data, response } = await this.requestWithResponse<{ login: string; name?: string | null }>('/user')
+    const rawScopes = response.headers.get('x-oauth-scopes') ?? ''
+    const scopes = rawScopes
+      .split(',')
+      .map(scope => scope.trim())
+      .filter(scope => scope !== '')
+    return { ...data, scopes }
+  }
+
+  /**
+   * Execute a GitHub GraphQL query or mutation against `${baseUrl}/graphql`.
+   */
+  async graphql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
+    const endpoint = '/graphql'
+    const url = `${this.baseUrl}${endpoint}`
+    const token = this.getToken()
+    const headers: Record<string, string> = {
+      accept: 'application/vnd.github+json',
+      'content-type': 'application/json',
+      'user-agent': 'dsh-task-board',
+      'x-github-api-version': '2022-11-28',
+    }
+    if (token !== undefined) {
+      headers.authorization = `Bearer ${token}`
+    }
+    const response = await this.boundedFetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query, variables }),
+    })
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const data = await response.json() as { message?: string }
+        if (typeof data?.message === 'string' && data.message !== '') errorDetail = data.message
+      } catch {
+        // use statusText
+      }
+      throw new GitHubApiError(response.status, `GitHub GraphQL error (${response.status}): ${errorDetail}`, endpoint)
+    }
+    const payload = await response.json() as {
+      data?: T
+      errors?: Array<{ type?: string; message?: string }>
+    }
+    if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+      const first = payload.errors[0]!
+      const msg = payload.errors.map(err => err.message ?? 'GraphQL error').join('; ')
+      const types = new Set(payload.errors.map(err => (err.type ?? '').toUpperCase()))
+      if (types.has('INSUFFICIENT_SCOPES') || types.has('FORBIDDEN') || /insufficient.*scope|forbidden/i.test(msg)) {
+        throw new GitHubApiError(403, `GitHub GraphQL error (403): ${msg}`, endpoint)
+      }
+      if (types.has('NOT_FOUND') || /could not resolve/i.test(first.message ?? '')) {
+        throw new GitHubApiError(404, `GitHub GraphQL error (404): ${msg}`, endpoint)
+      }
+      throw new GitHubApiError(422, `GitHub GraphQL error: ${msg}`, endpoint)
+    }
+    return payload.data as T
+  }
+
+  /** List organizations the authenticated user belongs to. */
+  async listOrganizations(): Promise<GitHubOrganizationSummary[]> {
+    const raw = await this.request<Array<{ login: string; description?: string | null; avatar_url?: string }>>('/user/orgs?per_page=100')
+    return raw.map(org => ({
+      login: org.login,
+      ...(org.avatar_url !== undefined ? { avatarUrl: org.avatar_url } : {}),
+    }))
+  }
+
+  /** List repositories accessible to the authenticated user. */
+  async listUserRepositories(perPage = 100): Promise<GitHubRemoteRepositorySummary[]> {
+    const raw = await this.request<Array<{
+      name: string
+      full_name: string
+      private: boolean
+      default_branch?: string
+      description?: string | null
+      html_url?: string
+      owner?: { login?: string }
+    }>>(`/user/repos?per_page=${String(perPage)}&sort=updated`)
+    return raw.map(repo => ({
+      owner: repo.owner?.login ?? repo.full_name.split('/')[0] ?? '',
+      name: repo.name,
+      fullName: repo.full_name,
+      private: repo.private,
+      ...(repo.default_branch !== undefined ? { defaultBranch: repo.default_branch } : {}),
+      ...(repo.description !== undefined ? { description: repo.description } : {}),
+      ...(repo.html_url !== undefined ? { htmlUrl: repo.html_url } : {}),
+    }))
+  }
+
+  /** List repositories belonging to an organization. */
+  async listOrgRepositories(org: string, perPage = 100): Promise<GitHubRemoteRepositorySummary[]> {
+    const raw = await this.request<Array<{
+      name: string
+      full_name: string
+      private: boolean
+      default_branch?: string
+      description?: string | null
+      html_url?: string
+      owner?: { login?: string }
+    }>>(`/orgs/${encodeURIComponent(org)}/repos?per_page=${String(perPage)}&sort=updated`)
+    return raw.map(repo => ({
+      owner: repo.owner?.login ?? org,
+      name: repo.name,
+      fullName: repo.full_name,
+      private: repo.private,
+      ...(repo.default_branch !== undefined ? { defaultBranch: repo.default_branch } : {}),
+      ...(repo.description !== undefined ? { description: repo.description } : {}),
+      ...(repo.html_url !== undefined ? { htmlUrl: repo.html_url } : {}),
+    }))
+  }
+
+  /** Create a new issue in a repository. */
+  async createIssue(
+    owner: string,
+    repo: string,
+    input: { title: string; body?: string; labels?: string[]; assignees?: string[] },
+  ): Promise<GitHubIssuePayload> {
+    const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`
+    return await this.request<GitHubIssuePayload>(endpoint, { method: 'POST', body: input })
+  }
+
+  /** List Projects v2 owned by an organization. */
+  async listOrgProjects(org: string): Promise<GitHubRemoteProjectSummary[]> {
+    const query = `query($org: String!) {
+      organization(login: $org) {
+        projectsV2(first: 50) {
+          nodes { id number title url closed }
+        }
+      }
+    }`
+    const data = await this.graphql<{
+      organization?: { projectsV2?: { nodes?: Array<{ id: string; number: number; title: string; url: string; closed?: boolean } | null> } }
+    }>(query, { org })
+    const nodes = data?.organization?.projectsV2?.nodes ?? []
+    return nodes
+      .filter((n): n is NonNullable<typeof n> => n !== null)
+      .map(n => ({
+        id: n.id,
+        number: n.number,
+        title: n.title,
+        url: n.url,
+        ownerType: 'organization' as const,
+        owner: org,
+        ...(typeof n.closed === 'boolean' ? { closed: n.closed } : {}),
+      }))
+  }
+
+  /** List Projects v2 owned by the authenticated user. */
+  async listUserProjects(): Promise<GitHubRemoteProjectSummary[]> {
+    const query = `query {
+      viewer {
+        login
+        projectsV2(first: 50) {
+          nodes { id number title url closed }
+        }
+      }
+    }`
+    const data = await this.graphql<{
+      viewer?: { login?: string; projectsV2?: { nodes?: Array<{ id: string; number: number; title: string; url: string; closed?: boolean } | null> } }
+    }>(query)
+    const owner = data?.viewer?.login ?? ''
+    const nodes = data?.viewer?.projectsV2?.nodes ?? []
+    return nodes
+      .filter((n): n is NonNullable<typeof n> => n !== null)
+      .map(n => ({
+        id: n.id,
+        number: n.number,
+        title: n.title,
+        url: n.url,
+        ownerType: 'user' as const,
+        owner,
+        ...(typeof n.closed === 'boolean' ? { closed: n.closed } : {}),
+      }))
+  }
+
+  /** Read a Project v2, its Status single-select field/options, and up to 200 items. */
+  async getProjectV2(
+    ownerType: GitHubProjectOwnerType,
+    owner: string,
+    projectNumber: number,
+  ): Promise<GitHubProjectDetailPayload> {
+    const rootField = ownerType === 'user' ? 'user' : 'organization'
+    const query = `query($owner: String!, $number: Int!, $after: String) {
+      ${rootField}(login: $owner) {
+        projectV2(number: $number) {
+          id
+          number
+          title
+          url
+          fields(first: 30) {
+            nodes {
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options { id name }
+              }
+            }
+          }
+          items(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              updatedAt
+              fieldValueByName(name: "Status") {
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  optionId
+                  name
+                }
+              }
+              content {
+                __typename
+                ... on Issue {
+                  id
+                  number
+                  title
+                  body
+                  state
+                  url
+                  updatedAt
+                  repository { name owner { login } }
+                  labels(first: 20) { nodes { name } }
+                  assignees(first: 10) { nodes { login } }
+                }
+                ... on DraftIssue {
+                  id
+                  title
+                  body
+                  updatedAt
+                  assignees(first: 10) { nodes { login } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`
+
+    let projectMeta: { id: string; number: number; title: string; url: string; statusFieldId?: string; statusOptions: GitHubProjectStatusOption[] } | undefined
+    const items: GitHubProjectItemPayload[] = []
+    let after: string | null = null
+
+    for (let page = 0; page < 2; page += 1) {
+      const data: Record<string, { projectV2?: GraphQLProjectNode | null } | null> = await this.graphql(query, {
+        owner,
+        number: projectNumber,
+        after,
+      })
+      const projectNode = data?.[rootField]?.projectV2
+      if (!projectNode) {
+        throw new GitHubApiError(404, `GitHub Project v2 not found: ${owner}#${String(projectNumber)}`, '/graphql')
+      }
+      if (projectMeta === undefined) {
+        const statusField = (projectNode.fields?.nodes ?? []).find(
+          f => f !== null && f.name?.toLowerCase() === 'status' && Array.isArray(f.options),
+        )
+        projectMeta = {
+          id: projectNode.id,
+          number: projectNode.number,
+          title: projectNode.title,
+          url: projectNode.url,
+          ...(statusField?.id !== undefined ? { statusFieldId: statusField.id } : {}),
+          statusOptions: (statusField?.options ?? []).map(opt => ({ id: opt.id, name: opt.name })),
+        }
+      }
+
+      for (const node of projectNode.items?.nodes ?? []) {
+        if (!node || !node.content) continue
+        const parsed = parseProjectItemNode(node, projectNode.url)
+        if (parsed !== undefined) items.push(parsed)
+        if (items.length >= 200) break
+      }
+
+      const pageInfo = projectNode.items?.pageInfo
+      if (!pageInfo?.hasNextPage || !pageInfo.endCursor || items.length >= 200) break
+      after = pageInfo.endCursor
+    }
+
+    return {
+      ...projectMeta!,
+      ownerType,
+      owner,
+      items,
+    }
+  }
+
+  /** Add an existing repository Issue/PR (by GraphQL content node id) to a Project v2. */
+  async addProjectV2ItemById(projectId: string, contentId: string): Promise<string> {
+    const mutation = `mutation($projectId: ID!, $contentId: ID!) {
+      addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+        item { id }
+      }
+    }`
+    const data = await this.graphql<{ addProjectV2ItemById?: { item?: { id: string } } }>(mutation, { projectId, contentId })
+    const itemId = data?.addProjectV2ItemById?.item?.id
+    if (!itemId) throw new GitHubApiError(500, 'GitHub GraphQL did not return added project item id', '/graphql')
+    return itemId
+  }
+
+  /** Create a DraftIssue directly inside a Project v2. */
+  async addProjectV2DraftIssue(
+    projectId: string,
+    input: { title: string; body?: string; assigneeIds?: string[] },
+  ): Promise<{ itemId: string; draftIssueId?: string }> {
+    const mutation = `mutation($projectId: ID!, $title: String!, $body: String, $assigneeIds: [ID!]) {
+      addProjectV2DraftIssue(input: { projectId: $projectId, title: $title, body: $body, assigneeIds: $assigneeIds }) {
+        projectItem {
+          id
+          content {
+            ... on DraftIssue { id }
+          }
+        }
+      }
+    }`
+    const data = await this.graphql<{
+      addProjectV2DraftIssue?: { projectItem?: { id: string; content?: { id?: string } } }
+    }>(mutation, {
+      projectId,
+      title: input.title,
+      ...(input.body !== undefined ? { body: input.body } : {}),
+      ...(input.assigneeIds !== undefined ? { assigneeIds: input.assigneeIds } : {}),
+    })
+    const item = data?.addProjectV2DraftIssue?.projectItem
+    if (!item?.id) throw new GitHubApiError(500, 'GitHub GraphQL did not return created draft project item id', '/graphql')
+    return {
+      itemId: item.id,
+      ...(item.content?.id !== undefined ? { draftIssueId: item.content.id } : {}),
+    }
+  }
+
+  /** Update the Status single-select field on a Project v2 item. */
+  async updateProjectV2ItemStatus(
+    projectId: string,
+    itemId: string,
+    fieldId: string,
+    optionId: string,
+  ): Promise<void> {
+    const mutation = `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId,
+        itemId: $itemId,
+        fieldId: $fieldId,
+        value: { singleSelectOptionId: $optionId }
+      }) {
+        projectV2Item { id }
+      }
+    }`
+    await this.graphql(mutation, { projectId, itemId, fieldId, optionId })
+  }
+
   /** Read one repository's identity facts, or throw the status that refused it. */
   async getRepository(owner: string, repo: string): Promise<{ full_name?: string; default_branch?: string; private?: boolean }> {
     const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
@@ -477,5 +855,91 @@ export class GitHubApiClient {
     const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?${params.toString()}`
     const raw = await this.request<GitHubIssuePayload[]>(endpoint)
     return raw.filter(item => item.pull_request === undefined)
+  }
+}
+
+interface GraphQLProjectNode {
+  id: string
+  number: number
+  title: string
+  url: string
+  fields?: {
+    nodes?: Array<{ id?: string; name?: string; options?: Array<{ id: string; name: string }> } | null>
+  }
+  items?: {
+    pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }
+    nodes?: Array<GraphQLProjectItemNode | null>
+  }
+}
+
+interface GraphQLProjectItemNode {
+  id: string
+  updatedAt?: string
+  fieldValueByName?: { optionId?: string; name?: string } | null
+  content?: {
+    __typename?: string
+    id?: string
+    number?: number
+    title?: string
+    body?: string | null
+    state?: string
+    url?: string
+    updatedAt?: string
+    repository?: { name?: string; owner?: { login?: string } }
+    labels?: { nodes?: Array<{ name: string } | null> }
+    assignees?: { nodes?: Array<{ login: string } | null> }
+  } | null
+}
+
+function parseProjectItemNode(node: GraphQLProjectItemNode, projectUrl: string): GitHubProjectItemPayload | undefined {
+  const content = node.content
+  if (!content) return undefined
+  const type = content.__typename
+  if (type !== 'Issue' && type !== 'DraftIssue') return undefined
+
+  const statusOptionId = node.fieldValueByName?.optionId
+  const statusName = node.fieldValueByName?.name
+  const assignees = (content.assignees?.nodes ?? [])
+    .filter((a): a is { login: string } => a !== null && typeof a.login === 'string')
+    .map(a => a.login)
+
+  if (type === 'DraftIssue') {
+    return {
+      itemId: node.id,
+      ...(statusOptionId !== undefined ? { statusOptionId } : {}),
+      ...(statusName !== undefined ? { statusName } : {}),
+      ...(content.updatedAt ?? node.updatedAt ? { updatedAt: content.updatedAt ?? node.updatedAt } : {}),
+      contentType: 'DraftIssue',
+      isDraft: true,
+      ...(content.id !== undefined ? { draftIssueId: content.id } : {}),
+      title: content.title ?? '',
+      ...(content.body != null ? { body: content.body } : {}),
+      url: projectUrl,
+      ...(assignees.length > 0 ? { assignees } : {}),
+    }
+  }
+
+  const labels = (content.labels?.nodes ?? [])
+    .filter((l): l is { name: string } => l !== null && typeof l.name === 'string')
+    .map(l => l.name)
+  const state = content.state?.toLowerCase() === 'closed' ? 'closed' : 'open'
+
+  return {
+    itemId: node.id,
+    ...(statusOptionId !== undefined ? { statusOptionId } : {}),
+    ...(statusName !== undefined ? { statusName } : {}),
+    ...(content.updatedAt ?? node.updatedAt ? { updatedAt: content.updatedAt ?? node.updatedAt } : {}),
+    contentType: 'Issue',
+    isDraft: false,
+    ...(content.number !== undefined ? { issueNumber: content.number } : {}),
+    ...(content.id !== undefined ? { issueNodeId: content.id } : {}),
+    ...(content.repository?.owner?.login !== undefined ? { owner: content.repository.owner.login } : {}),
+    ...(content.repository?.name !== undefined ? { repository: content.repository.name } : {}),
+    title: content.title ?? '',
+    ...(content.body != null ? { body: content.body } : {}),
+    state,
+    url: content.url ?? projectUrl,
+    labels,
+    ...(assignees.length > 0 ? { assignees } : {}),
   }
 }

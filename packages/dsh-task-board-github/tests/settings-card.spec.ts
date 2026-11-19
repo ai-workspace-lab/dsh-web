@@ -13,13 +13,24 @@ import type { GitHubSetupApi } from '../src/client/setup-api.ts'
  */
 const idleProxy = { mode: 'auto' as const, url: '' }
 const idleSetupApi: GitHubSetupApi = {
-  status: async () => ({ credential: { configured: false, writable: false, envName: 'GITHUB_TOKEN' }, repositories: [], running: false, settingsWritable: false, proxy: idleProxy }),
+  status: async () => ({ credential: { configured: false, writable: false, envName: 'GITHUB_TOKEN' }, repositories: [], projects: [], running: false, settingsWritable: false, proxy: idleProxy }),
   test: async () => ({ ok: false, credential: { configured: false, writable: false, envName: 'GITHUB_TOKEN' }, checks: [] }),
-  setCredential: async () => ({ credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], running: false, settingsWritable: true, proxy: idleProxy }),
-  clearCredential: async () => ({ credential: { configured: false, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], running: false, settingsWritable: true, proxy: idleProxy }),
+  setCredential: async () => ({ credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], projects: [], running: false, settingsWritable: true, proxy: idleProxy }),
+  clearCredential: async () => ({ credential: { configured: false, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], projects: [], running: false, settingsWritable: true, proxy: idleProxy }),
   listRepositories: async () => [],
   writeRepositories: async repositories => [...repositories],
-  setProxy: async () => ({ credential: { configured: false, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], running: false, settingsWritable: true, proxy: idleProxy }),
+  setProxy: async () => ({ credential: { configured: false, writable: true, envName: 'GITHUB_TOKEN' }, repositories: [], projects: [], running: false, settingsWritable: true, proxy: idleProxy }),
+  startDeviceAuth: async () => ({ flowId: 'flow-1', userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', expiresIn: 900, interval: 5 }),
+  pollDeviceAuth: async () => ({ status: 'pending', interval: 5 }),
+  cancelDeviceAuth: async () => {},
+  importLocalAuth: async () => ({ ok: false, message: 'none' }),
+  listProjects: async () => [],
+  writeProjects: async projects => [...projects],
+  discoverOrgs: async () => ({ login: '', organizations: [] }),
+  discoverProjects: async () => [],
+  discoverRepositories: async () => [],
+  createRemoteTask: async () => { throw new Error('unused') },
+  triggerSync: async () => ({ synced: 0, errors: [] }),
 }
 
 /**

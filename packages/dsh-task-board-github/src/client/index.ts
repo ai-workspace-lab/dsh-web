@@ -63,6 +63,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     'task-board.settings.section': { kind: 'list'; scope: 'root'; owner: import('../core/contract.ts').TaskBoardSettingsSectionProps }
     /** Provider card decoration; the board declares and renders it. */
     'task-board.card.decoration': { kind: 'list'; scope: 'root'; owner: import('../core/contract.ts').TaskBoardCardDecorationProps }
+    /** Provider task-create backend section; the board declares and renders it. */
+    'task-board.create.section': { kind: 'list'; scope: 'root'; owner: import('../core/contract.ts').TaskBoardCreateSectionProps }
   }
 
   interface LocaleNamespaceMap {
@@ -188,6 +190,6 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => installGitHubClientHalf(ctx, enabledSource, {
     inject: () => controller.inject(),
     component: GitHubSettingsSection,
-  }), 'task-board-github: provider seats')
+  }, setupApi), 'task-board-github: provider seats')
   ctx.effect(() => () => { controller.dispose() }, 'task-board-github: provider settings section')
 }

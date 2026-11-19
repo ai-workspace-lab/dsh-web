@@ -22,9 +22,14 @@ import {
   ME_ASSIGNEE,
   normalizeGitHubMetadata,
   readTaskGitHubMetadata,
+  resolveProjectConfig,
+  type GitHubProjectConfig,
+  type GitHubProjectOwnerType,
+  type GitHubProjectStatusOption,
   type GitHubPullRequestMetadata,
   type GitHubRepoConfig,
   type GitHubTaskMetadata,
+  type ResolvedGitHubProjectConfig,
   type ResolvedGitHubRepoConfig,
   resolveRepoConfig,
 } from '../core/types.ts'
@@ -34,9 +39,13 @@ import {
   isDshManagedLabel,
   isIssueIncluded,
   materializeTaskFromIssue,
+  materializeTaskFromProjectItem,
   reconcileIssueWithTask,
+  reconcileProjectItemWithTask,
   reconcileRemoteClose,
+  resolveProjectOptionForStatus,
 } from '../core/projection.ts'
+import { projectSlug } from '../core/setup.ts'
 import { isPromptEdited, issueSourceHash, type IssuePromptSource } from '../core/prompt.ts'
 import { workspaceIdForRepository, type WorkspaceMatchCandidate } from '../core/workspace-match.ts'
 import { IssueAnalysisError, splitModelRoute, type AnalysisRoute, type IssueAnalyzer } from './analysis.ts'
@@ -73,6 +82,7 @@ export interface GitHubSyncServiceOptions {
   host: TaskBoardExtensionHost
   client?: GitHubApiClient
   repositories?: GitHubRepoConfig[]
+  projects?: GitHubProjectConfig[]
   timers?: HostTimerFace
   now?: () => number
   /**
@@ -132,10 +142,16 @@ function identityKey(owner: string, repository: string, issueNumber: number): st
   return `${owner.toLowerCase()}/${repository.toLowerCase()}#${String(issueNumber)}`
 }
 
+/** Stable key of one Project v2 draft item identity. */
+function projectDraftKey(projectId: string, itemId: string): string {
+  return `project-draft:${projectId}:${itemId}`
+}
+
 export class GitHubSyncService {
   readonly host: TaskBoardExtensionHost
   readonly client: GitHubApiClient
   readonly repositories: ResolvedGitHubRepoConfig[]
+  readonly projects: ResolvedGitHubProjectConfig[]
   private readonly timers: HostTimerFace
   private readonly now: () => number
   private readonly workspaceRegistry: (() => WorkspaceRegistryFace | undefined) | undefined
@@ -153,6 +169,10 @@ export class GitHubSyncService {
   private consecutiveEmptySyncs = 0
   /** Immutable remote identity -> local card id, owned by this provider. */
   private readonly identityIndex = new Map<string, string>()
+  /** Project draft identity -> local card id, owned by this provider. */
+  private readonly projectDraftIndex = new Map<string, string>()
+  /** Cached Status single-select field metadata per configured Project v2. */
+  private readonly projectStatusCache = new Map<string, { statusFieldId?: string; statusOptions: readonly GitHubProjectStatusOption[] }>()
   /** Login this credential authenticates as, resolved once for an `@me` inclusion rule. */
   private authenticatedLogin: string | undefined
   private readonly analyzer: IssueAnalyzer | undefined
@@ -164,6 +184,7 @@ export class GitHubSyncService {
     this.host = options.host
     this.client = options.client ?? new GitHubApiClient(proxyClientOptions(options.proxy?.()))
     this.repositories = (options.repositories ?? []).map(resolveRepoConfig)
+    this.projects = (options.projects ?? []).map(resolveProjectConfig)
     this.timers = options.timers ?? DEFAULT_TIMERS
     this.now = options.now ?? Date.now
     this.workspaceRegistry = options.workspaceRegistry
@@ -256,14 +277,40 @@ export class GitHubSyncService {
     return this.repositories.find(cfg => cfg.owner.toLowerCase() === o && cfg.repository.toLowerCase() === r)
   }
 
-  /** Start background polling across configured repositories. */
+  /** Find configured Project v2 matching ownerType, owner, and projectNumber. */
+  findProjectConfig(ownerType: GitHubProjectOwnerType, owner: string, projectNumber: number): ResolvedGitHubProjectConfig | undefined {
+    const o = owner.toLowerCase()
+    return this.projects.find(
+      cfg => cfg.ownerType === ownerType && cfg.owner.toLowerCase() === o && cfg.projectNumber === projectNumber,
+    )
+  }
+
+  /**
+   * Resolve the repository config for a task's issue: configured repo first,
+   * or a synthesized config when the card came from a Project v2 issue.
+   * Draft items are never backed by a repository issue and return undefined.
+   */
+  private resolveEffectiveRepoForTask(gh: GitHubTaskMetadata): ResolvedGitHubRepoConfig | undefined {
+    if (gh.project?.isDraft === true || gh.repository === '' || gh.issueNumber <= 0) {
+      return undefined
+    }
+    const configured = this.findRepoConfig(gh.owner, gh.repository)
+    if (configured !== undefined) return configured
+    if (gh.project !== undefined) {
+      return resolveRepoConfig({ owner: gh.owner, repository: gh.repository })
+    }
+    return undefined
+  }
+
+  /** Start background polling across configured repositories and projects. */
   start(): void {
     if (this.stopped || this.pollTimer !== undefined) return
     this.reindex()
     this.clearStalePendingAnalyses()
-    const intervals = this.repositories
-      .map(r => r.pollingIntervalMs)
-      .filter(ms => ms > 0)
+    const intervals = [
+      ...this.repositories.map(r => r.pollingIntervalMs),
+      ...this.projects.map(p => p.pollingIntervalMs),
+    ].filter(ms => ms > 0)
     if (intervals.length === 0) return
 
     const minInterval = Math.min(...intervals)
@@ -308,6 +355,8 @@ export class GitHubSyncService {
     this.stopped = true
     this.stop()
     this.identityIndex.clear()
+    this.projectDraftIndex.clear()
+    this.projectStatusCache.clear()
     for (const { controller } of this.analyses.values()) controller.abort()
     this.analyses.clear()
   }
@@ -383,7 +432,8 @@ export class GitHubSyncService {
     const task = this.host.tasks.get(taskId)
     const gh = this.metadataOf(task)
     if (task === undefined || gh === undefined) throw new AnalysisRequestError('not-linked', 'task is not linked to a GitHub issue')
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (gh.project?.isDraft === true) throw new AnalysisRequestError('not-linked', 'Project draft item is not backed by a repository issue yet')
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) throw new AnalysisRequestError('not-configured', `repository ${gh.owner}/${gh.repository} is not configured`)
     if (this.analyzer === undefined) throw new AnalysisRequestError('no-analyzer', 'this deployment serves no model service for issue analysis')
     if (task.executions.length > 0 || task.archivedAt !== undefined) {
@@ -431,7 +481,7 @@ export class GitHubSyncService {
     const task = this.host.tasks.get(taskId)
     const gh = this.metadataOf(task)
     if (task === undefined || gh === undefined) return
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) return
     const generated = composeIssuePrompt(
       { number: gh.issueNumber, html_url: gh.issueUrl, title: gh.remoteTitle ?? '', body: gh.remoteBody ?? '', labels: gh.remoteLabels },
@@ -462,7 +512,8 @@ export class GitHubSyncService {
     const task = this.host.tasks.get(taskId)
     const gh = this.metadataOf(task)
     if (task === undefined || gh === undefined) throw new AnalysisRequestError('not-linked', 'task is not linked to a GitHub issue')
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (gh.project?.isDraft === true) throw new AnalysisRequestError('not-linked', 'Project draft item is not backed by a repository issue yet')
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) throw new AnalysisRequestError('not-configured', `repository ${gh.owner}/${gh.repository} is not configured`)
     if (task.executions.length > 0 || task.archivedAt !== undefined) {
       throw new AnalysisRequestError('frozen', 'the card has started executing; its prompt is read-only')
@@ -498,17 +549,24 @@ export class GitHubSyncService {
    */
   reindex(): void {
     this.identityIndex.clear()
+    this.projectDraftIndex.clear()
     for (const { task, payload } of this.host.tasks.linked()) {
       const metadata = normalizeGitHubMetadata(payload)
       if (metadata === undefined) continue
-      this.identityIndex.set(identityKey(metadata.owner, metadata.repository, metadata.issueNumber), task.id)
+      this.remember(task.id, metadata)
     }
   }
 
   /** Record one card's identity in the index. */
   private remember(taskId: string, metadata: GitHubTaskMetadata | undefined): void {
     if (metadata === undefined) return
-    this.identityIndex.set(identityKey(metadata.owner, metadata.repository, metadata.issueNumber), taskId)
+    if (metadata.project?.isDraft === true) {
+      this.projectDraftIndex.set(projectDraftKey(metadata.project.projectId, metadata.project.itemId), taskId)
+      return
+    }
+    if (metadata.repository !== '' && metadata.issueNumber > 0) {
+      this.identityIndex.set(identityKey(metadata.owner, metadata.repository, metadata.issueNumber), taskId)
+    }
   }
 
   /**
@@ -519,6 +577,9 @@ export class GitHubSyncService {
   handleTaskDeleted(taskId: string): void {
     for (const [key, value] of [...this.identityIndex]) {
       if (value === taskId) this.identityIndex.delete(key)
+    }
+    for (const [key, value] of [...this.projectDraftIndex]) {
+      if (value === taskId) this.projectDraftIndex.delete(key)
     }
   }
 
@@ -540,6 +601,20 @@ export class GitHubSyncService {
     // rather than losing an identity the board still holds.
     this.reindex()
     const found = this.identityIndex.get(key)
+    return found === undefined ? undefined : this.host.tasks.get(found)
+  }
+
+  /** Find a local task by a Project v2 draft item identity. */
+  private findByProjectDraftIdentity(projectId: string, itemId: string): TaskRecord | undefined {
+    const key = projectDraftKey(projectId, itemId)
+    const known = this.projectDraftIndex.get(key)
+    if (known !== undefined) {
+      const task = this.host.tasks.get(known)
+      if (task !== undefined) return task
+      this.projectDraftIndex.delete(key)
+    }
+    this.reindex()
+    const found = this.projectDraftIndex.get(key)
     return found === undefined ? undefined : this.host.tasks.get(found)
   }
 
@@ -678,8 +753,13 @@ export class GitHubSyncService {
     if (!this.client.hasCredential()) {
       // One reason for the whole pass, not one per repository: the same cause
       // reported seven times reads as seven problems.
+      const targetLabel = this.repositories[0] !== undefined
+        ? `${this.repositories[0].owner}/${this.repositories[0].repository}`
+        : this.projects[0] !== undefined
+          ? projectSlug(this.projects[0])
+          : '?'
       const message = 'no GitHub API credential available (the harness credential store could not be read for '
-        + this.repositories[0]?.owner + '/' + (this.repositories[0]?.repository ?? '?')
+        + targetLabel
         + ' and no GITHUB_TOKEN / GH_TOKEN is set in the environment)'
       this.lastSyncErrors = [message]
       this.consecutiveEmptySyncs += 1
@@ -691,6 +771,15 @@ export class GitHubSyncService {
       for (const repo of this.repositories) {
         try {
           const result = await this.syncRepository(repo.owner, repo.repository)
+          totalSynced += result.synced
+          errors.push(...result.errors)
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error))
+        }
+      }
+      for (const project of this.projects) {
+        try {
+          const result = await this.syncProject(project.ownerType, project.owner, project.projectNumber)
           totalSynced += result.synced
           errors.push(...result.errors)
         } catch (error) {
@@ -719,9 +808,10 @@ export class GitHubSyncService {
 
   /** The shortest configured poll interval, the re-entry guard's own bound. */
   private pollIntervalMs(): number {
-    const intervals = this.repositories
-      .map(repository => repository.pollingIntervalMs)
-      .filter(ms => ms > 0)
+    const intervals = [
+      ...this.repositories.map(repository => repository.pollingIntervalMs),
+      ...this.projects.map(project => project.pollingIntervalMs),
+    ].filter(ms => ms > 0)
     return intervals.length === 0 ? 60_000 : Math.min(...intervals)
   }
 
@@ -743,7 +833,7 @@ export class GitHubSyncService {
     const now = this.now()
     const staleAfter = this.pollIntervalMs() * 3
     return {
-      running: !this.stopped && this.repositories.length > 0,
+      running: !this.stopped && (this.repositories.length > 0 || this.projects.length > 0),
       inFlight: this.inFlight !== undefined,
       ...(this.lastSyncAt === undefined ? {} : { lastSyncAt: this.lastSyncAt }),
       lastErrors: [...this.lastSyncErrors],
@@ -784,6 +874,16 @@ export class GitHubSyncService {
           activeIssueNumbers.add(issue.number)
           if (existing !== undefined) {
             let updated = reconcileIssueWithTask(existing, issue, now, effective)
+            const existingProject = this.metadataOf(existing)?.project
+            if (existingProject !== undefined && this.metadataOf(updated)?.project === undefined) {
+              updated = {
+                ...updated,
+                integrations: {
+                  ...updated.integrations,
+                  github: { ...this.payloadOf(updated), project: existingProject },
+                },
+              }
+            }
             // If task has a linked PR, check PR status as well
             if (this.metadataOf(updated)?.pullRequest !== undefined) {
               updated = await this.checkPullRequestStatus(updated, effective)
@@ -854,6 +954,80 @@ export class GitHubSyncService {
     return { synced, errors }
   }
 
+  /** Synchronize a single GitHub Project v2 by ownerType, owner, and projectNumber. */
+  async syncProject(
+    ownerType: GitHubProjectOwnerType,
+    owner: string,
+    projectNumber: number,
+  ): Promise<{ synced: number; errors: string[] }> {
+    const config = this.findProjectConfig(ownerType, owner, projectNumber)
+    if (config === undefined) {
+      return { synced: 0, errors: [`project ${ownerType}:${owner}#${String(projectNumber)} is not configured`] }
+    }
+    if (!this.client.hasCredential()) {
+      return { synced: 0, errors: ['no GitHub API credential available'] }
+    }
+
+    const now = this.now()
+    const errors: string[] = []
+    let synced = 0
+
+    try {
+      const detail = await this.client.getProjectV2(config.ownerType, config.owner, config.projectNumber)
+      this.projectStatusCache.set(projectSlug(config).toLowerCase(), {
+        ...(detail.statusFieldId !== undefined ? { statusFieldId: detail.statusFieldId } : {}),
+        statusOptions: detail.statusOptions,
+      })
+
+      for (const item of detail.items) {
+        if (item.contentType === 'Issue' && item.owner && item.repository && item.issueNumber !== undefined && item.issueNumber > 0) {
+          const existing = this.findByGitHubIdentity(item.owner, item.repository, item.issueNumber)
+          const repoConfig = this.findRepoConfig(item.owner, item.repository)
+            ?? resolveRepoConfig({ owner: item.owner, repository: item.repository })
+          if (existing !== undefined) {
+            let updated = reconcileProjectItemWithTask(existing, item, detail, now, config, repoConfig)
+            if (this.metadataOf(updated)?.pullRequest !== undefined) {
+              updated = await this.checkPullRequestStatus(updated, repoConfig)
+            }
+            this.applyRecord(updated, existing)
+            synced += 1
+          } else {
+            const newTask = materializeTaskFromProjectItem(item, detail, crypto.randomUUID(), now, config, repoConfig)
+            this.applyRecord(newTask, undefined)
+            synced += 1
+          }
+        } else if ((item.contentType === 'DraftIssue' || item.isDraft) && config.includeDrafts) {
+          const existing = this.findByProjectDraftIdentity(detail.id, item.itemId)
+          if (existing !== undefined) {
+            const updated = reconcileProjectItemWithTask(existing, item, detail, now, config)
+            this.applyRecord(updated, existing)
+            synced += 1
+          } else {
+            const newTask = materializeTaskFromProjectItem(item, detail, crypto.randomUUID(), now, config)
+            this.applyRecord(newTask, undefined)
+            synced += 1
+          }
+        }
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      errors.push(msg)
+      for (const task of this.host.tasks.list()) {
+        const gh = this.metadataOf(task)
+        if (
+          gh?.project !== undefined
+          && gh.project.ownerType === config.ownerType
+          && gh.project.owner.toLowerCase() === config.owner.toLowerCase()
+          && gh.project.projectNumber === config.projectNumber
+        ) {
+          this.writePayload(task.id, { lastSyncError: msg })
+        }
+      }
+    }
+
+    return { synced, errors }
+  }
+
   /** Synchronize one specific task by task ID. */
   async syncTask(taskId: string): Promise<{ ok: boolean; error?: string; task?: TaskRecord }> {
     const task = this.host.tasks.get(taskId)
@@ -861,19 +1035,53 @@ export class GitHubSyncService {
     if (task === undefined || metadata === undefined) {
       return { ok: false, error: 'task is not linked to GitHub' }
     }
-    const config = this.findRepoConfig(metadata.owner, metadata.repository)
-    if (config === undefined) {
-      return { ok: false, error: `repository ${metadata.owner}/${metadata.repository} is not configured` }
-    }
     if (!this.client.hasCredential()) {
       return { ok: false, error: 'no GitHub API credential available' }
     }
 
     const now = this.now()
+    if (metadata.project?.isDraft === true) {
+      const proj = metadata.project
+      const config = this.findProjectConfig(proj.ownerType, proj.owner, proj.projectNumber)
+        ?? resolveProjectConfig({ ownerType: proj.ownerType, owner: proj.owner, projectNumber: proj.projectNumber })
+      try {
+        const detail = await this.client.getProjectV2(proj.ownerType, proj.owner, proj.projectNumber)
+        this.projectStatusCache.set(projectSlug(config).toLowerCase(), {
+          ...(detail.statusFieldId !== undefined ? { statusFieldId: detail.statusFieldId } : {}),
+          statusOptions: detail.statusOptions,
+        })
+        const item = detail.items.find(candidate => candidate.itemId === proj.itemId)
+        if (item === undefined) {
+          return { ok: false, error: 'Project draft item no longer exists on GitHub' }
+        }
+        const updated = reconcileProjectItemWithTask(task, item, detail, now, config)
+        this.applyRecord(updated, task)
+        return { ok: true, task: this.host.tasks.get(taskId) }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.writePayload(task.id, { lastSyncError: message })
+        return { ok: false, error: message }
+      }
+    }
+
+    const config = this.resolveEffectiveRepoForTask(metadata)
+    if (config === undefined) {
+      return { ok: false, error: `repository ${metadata.owner}/${metadata.repository} is not configured` }
+    }
+
     const effective = await this.effectiveConfig(config)
     try {
       const issue = await this.client.getIssue(effective.owner, effective.repository, metadata.issueNumber)
       let updated = reconcileIssueWithTask(task, issue, now, effective)
+      if (metadata.project !== undefined && this.metadataOf(updated)?.project === undefined) {
+        updated = {
+          ...updated,
+          integrations: {
+            ...updated.integrations,
+            github: { ...this.payloadOf(updated), project: metadata.project },
+          },
+        }
+      }
       if (this.metadataOf(updated)?.pullRequest !== undefined) {
         updated = await this.checkPullRequestStatus(updated, effective)
       }
@@ -898,7 +1106,10 @@ export class GitHubSyncService {
     if (task === undefined || gh === undefined) {
       throw new Error('task is not linked to a GitHub issue')
     }
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (gh.project?.isDraft === true) {
+      throw new Error('Project draft item is not backed by a repository issue yet')
+    }
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) {
       throw new Error(`repository ${gh.owner}/${gh.repository} is not configured`)
     }
@@ -967,15 +1178,57 @@ export class GitHubSyncService {
     return { issueNumber: gh.issueNumber, state: 'closed' }
   }
 
-  /** Write back local status changes to GitHub state labels. Never throws. */
+  /** Write back local status changes to GitHub state labels and/or Project v2 Status. Never throws. */
   async writeBackTaskStatus(taskId: string, targetStatus: TaskStatus): Promise<void> {
     const task = this.host.tasks.get(taskId)
     const gh = this.metadataOf(task)
     if (task === undefined || gh === undefined) return
-    const config = this.findRepoConfig(gh.owner, gh.repository)
-    if (config === undefined || !this.client.hasCredential()) return
+    if (!this.client.hasCredential()) return
 
     const now = this.now()
+
+    if (gh.project !== undefined) {
+      const proj = gh.project
+      const projectConfig = this.findProjectConfig(proj.ownerType, proj.owner, proj.projectNumber)
+        ?? resolveProjectConfig({ ownerType: proj.ownerType, owner: proj.owner, projectNumber: proj.projectNumber })
+      const cacheKey = projectSlug(projectConfig).toLowerCase()
+      try {
+        let cached = this.projectStatusCache.get(cacheKey)
+        if (cached === undefined || cached.statusFieldId === undefined || cached.statusOptions.length === 0) {
+          const detail = await this.client.getProjectV2(proj.ownerType, proj.owner, proj.projectNumber)
+          cached = {
+            ...(detail.statusFieldId !== undefined ? { statusFieldId: detail.statusFieldId } : {}),
+            statusOptions: detail.statusOptions,
+          }
+          this.projectStatusCache.set(cacheKey, cached)
+        }
+        const fieldId = cached.statusFieldId ?? proj.statusFieldId
+        if (fieldId !== undefined && cached.statusOptions.length > 0) {
+          const option = resolveProjectOptionForStatus(targetStatus, cached.statusOptions, projectConfig.statusMap)
+          if (option !== undefined && option.id !== proj.statusOptionId) {
+            await this.client.updateProjectV2ItemStatus(proj.projectId, proj.itemId, fieldId, option.id)
+            this.writePayload(task.id, {
+              project: {
+                ...proj,
+                statusFieldId: fieldId,
+                statusOptionId: option.id,
+                statusName: option.name,
+              },
+              lastSyncedAt: now,
+              lastSyncError: undefined,
+            })
+          }
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        this.writePayload(task.id, { lastSyncError: msg })
+      }
+    }
+
+    if (gh.project?.isDraft === true) return
+    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (config === undefined) return
+
     const prActive = gh.pullRequest !== undefined && gh.pullRequest.state === 'open'
     const { labelsToAdd, labelsToRemove } = computeLabelWriteBack(gh.remoteLabels, targetStatus, prActive, config)
 
@@ -1016,11 +1269,12 @@ export class GitHubSyncService {
         remoteClose: { state: 'settled', executionId: execution.id, settledStatus: task.status },
       })
     }
+    // Write back status (e.g. done or failed) before checking repo config so
+    // Project-only cards and drafts still update their Project Status column.
+    await this.writeBackTaskStatus(taskId, task.status)
+
     const config = this.findRepoConfig(gh.owner, gh.repository)
     if (config === undefined) return
-
-    // Write back status (e.g. done or failed)
-    await this.writeBackTaskStatus(taskId, task.status)
 
     // Auto PR creation check
     if (execution.result === 'succeeded' && config.prCreationEnabled && gh.pullRequest === undefined) {
@@ -1074,7 +1328,10 @@ export class GitHubSyncService {
     if (task === undefined || gh === undefined) {
       throw new Error('task is not linked to a GitHub issue')
     }
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (gh.project?.isDraft === true) {
+      throw new Error('Project draft item is not backed by a repository issue yet')
+    }
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) {
       throw new Error(`repository ${gh.owner}/${gh.repository} is not configured`)
     }
@@ -1152,7 +1409,10 @@ export class GitHubSyncService {
     if (task === undefined || gh === undefined) {
       throw new Error('task is not linked to a GitHub issue')
     }
-    const config = this.findRepoConfig(gh.owner, gh.repository)
+    if (gh.project?.isDraft === true) {
+      throw new Error('Project draft item is not backed by a repository issue yet')
+    }
+    const config = this.resolveEffectiveRepoForTask(gh)
     if (config === undefined) {
       throw new Error(`repository ${gh.owner}/${gh.repository} is not configured`)
     }
@@ -1312,7 +1572,7 @@ export class GitHubSyncService {
     })
   }
 
-  /** Summary of configured repositories and credential state for snapshot. */
+  /** Summary of configured repositories, projects, and credential state for snapshot. */
   snapshotSummary(): {
     enabled: boolean
     repositories: Array<{
@@ -1320,6 +1580,13 @@ export class GitHubSyncService {
       repository: string
       inclusionLabel: string
       prCreationEnabled: boolean
+      hasCredential: boolean
+    }>
+    projects: Array<{
+      ownerType: GitHubProjectOwnerType
+      owner: string
+      projectNumber: number
+      title?: string
       hasCredential: boolean
     }>
     hasCredential: boolean
@@ -1341,13 +1608,20 @@ export class GitHubSyncService {
   } {
     const hasCred = this.client.hasCredential()
     return {
-      enabled: this.repositories.length > 0,
+      enabled: this.repositories.length > 0 || this.projects.length > 0,
       hasCredential: hasCred,
       repositories: this.repositories.map(r => ({
         owner: r.owner,
         repository: r.repository,
         inclusionLabel: r.inclusionLabel,
         prCreationEnabled: r.prCreationEnabled,
+        hasCredential: hasCred,
+      })),
+      projects: this.projects.map(p => ({
+        ownerType: p.ownerType,
+        owner: p.owner,
+        projectNumber: p.projectNumber,
+        ...(p.title ? { title: p.title } : {}),
         hasCredential: hasCred,
       })),
       health: this.syncHealth(),

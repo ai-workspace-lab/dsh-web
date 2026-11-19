@@ -7,30 +7,63 @@
  */
 import { describe, expect, it } from 'vitest'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { GitHubRepoConfig } from '../src/core/types.ts'
+import type { GitHubProjectConfig, GitHubRepoConfig } from '../src/core/types.ts'
 import { GitHubSetupError, type GitHubSetup } from '../src/host/setup.ts'
 import { buildSetupTools } from '../src/host/tools.ts'
 
 /** A setup surface double: an in-memory list, recording what it was asked. */
-function setupDouble(initial: GitHubRepoConfig[] = []) {
+function setupDouble(initial: GitHubRepoConfig[] = [], initialProjects: GitHubProjectConfig[] = []) {
   let repositories = [...initial]
+  let projects = [...initialProjects]
   const calls: string[] = []
+  const summary = (configured = true) => ({
+    credential: { configured, writable: true, envName: 'GITHUB_TOKEN' },
+    repositories,
+    projects,
+    running: true,
+    settingsWritable: true,
+    proxy: { mode: 'auto' as const, url: '' },
+  })
   const setup: GitHubSetup = {
-    status: async () => { calls.push('status'); return { credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, repositories, running: true, settingsWritable: true, proxy: { mode: 'auto', url: '' } } },
-    test: async () => { calls.push('test'); return { ok: true, login: 'octocat', credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, checks: [] } },
-    setCredential: async token => { calls.push('setCredential ' + token); return { credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, repositories, running: true, settingsWritable: true, proxy: { mode: 'auto', url: '' } } },
-    clearCredential: async () => { calls.push('clearCredential'); return { credential: { configured: false, writable: true, envName: 'GITHUB_TOKEN' }, repositories, running: true, settingsWritable: true, proxy: { mode: 'auto', url: '' } } },
+    status: async () => { calls.push('status'); return summary(true) },
+    test: async () => { calls.push('test'); return { ok: true, login: 'octocat', scopes: ['repo', 'project'], credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, checks: [] } },
+    setCredential: async token => { calls.push('setCredential ' + token); return summary(true) },
+    clearCredential: async () => { calls.push('clearCredential'); return summary(false) },
+    startDeviceAuth: async () => ({ flowId: 'flow-1', userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', expiresIn: 900, interval: 5 }),
+    pollDeviceAuth: async () => ({ status: 'pending', interval: 5 }),
+    cancelDeviceAuth: () => true,
+    importLocalAuth: async () => {
+      calls.push('importLocalAuth')
+      return { ok: true, source: 'gh-cli', login: 'octocat', scopes: ['repo', 'project'], summary: summary(true) }
+    },
     listRepositories: () => { calls.push('listRepositories'); return [...repositories] },
     writeRepositories: async value => {
       calls.push('writeRepositories')
       repositories = value as GitHubRepoConfig[]
       return repositories
     },
+    listProjects: () => { calls.push('listProjects'); return [...projects] },
+    writeProjects: async value => {
+      calls.push('writeProjects')
+      projects = value as GitHubProjectConfig[]
+      return projects
+    },
+    discoverOrgs: async () => {
+      calls.push('discoverOrgs')
+      return [{ login: 'deepseek-ai', name: 'DeepSeek' }]
+    },
+    discoverProjects: async () => {
+      calls.push('discoverProjects')
+      return [{ id: 'PVT_1', number: 4, title: 'Roadmap', url: 'https://github.com/orgs/deepseek-ai/projects/4', ownerType: 'organization', owner: 'deepseek-ai' }]
+    },
+    discoverRepositories: async () => [],
+    createRemoteTask: async () => { throw new Error('not used in setup-tools.spec') },
+    triggerSync: async () => ({ ok: true }),
     credential: async () => ({ configured: true, writable: true, envName: 'GITHUB_TOKEN' }),
     proxy: () => ({ mode: 'auto', url: '' }),
-    setProxy: async () => { calls.push('setProxy'); return { credential: { configured: true, writable: true, envName: 'GITHUB_TOKEN' }, repositories, running: true, settingsWritable: true, proxy: { mode: 'auto', url: '' } } },
+    setProxy: async () => { calls.push('setProxy'); return summary(true) },
   }
-  return { setup, calls, list: () => repositories }
+  return { setup, calls, list: () => repositories, listProjects: () => projects }
 }
 
 /** Locate one setup tool by name. */
@@ -186,5 +219,65 @@ describe('GitHub setup tools', () => {
 
     // Then the refusal carries the host reason
     expect(result).toMatchObject({ ok: false, code: 'read-only', message: 'this deployment serves configuration read-only' })
+  })
+
+  it('operator\'s agent can import local auth and discover organizations', async () => {
+    // Given a setup surface with local auth and org discovery
+    const { setup, calls } = setupDouble([{ owner: 'deepseek-ai', repository: 'dsh-web' }])
+    const setupTool = toolOf(buildSetupTools(setup), 'task_board_github_setup')
+
+    // When import-local-auth and discover run
+    const imported = await run(setupTool, { action: 'import-local-auth' })
+    const discovered = await run(setupTool, { action: 'discover' })
+
+    // Then the imported source and discovered orgs/targets are returned without any token
+    expect(imported).toMatchObject({ ok: true, source: 'gh-cli', login: 'octocat' })
+    expect(discovered).toMatchObject({
+      ok: true,
+      account: 'octocat',
+      scopes: ['repo', 'project'],
+      organizations: [{ login: 'deepseek-ai', name: 'DeepSeek' }],
+      configuredRepositories: [{ owner: 'deepseek-ai', repository: 'dsh-web' }],
+      configuredProjects: [],
+    })
+    expect(calls).toContain('importLocalAuth')
+    expect(calls).toContain('discoverOrgs')
+  })
+
+  it('operator\'s agent can discover, add, update, and remove Projects v2', async () => {
+    // Given the projects tool and an empty project list
+    const { setup, listProjects } = setupDouble()
+    const tool = toolOf(buildSetupTools(setup), 'task_board_github_projects')
+
+    // When discovering, adding, updating, and removing a project
+    const discovered = await run(tool, { action: 'discover', ownerType: 'organization', owner: 'deepseek-ai' })
+    const added = await run(tool, {
+      action: 'add',
+      project: 'https://github.com/orgs/deepseek-ai/projects/4',
+      title: 'Roadmap',
+      includeDrafts: true,
+      statusMap: { running: 'Doing' },
+    })
+    const updated = await run(tool, {
+      action: 'update',
+      project: 'org/deepseek-ai/projects/4',
+      includeDrafts: false,
+    })
+    const listed = await run(tool, { action: 'list' })
+    const removed = await run(tool, { action: 'remove', project: 'deepseek-ai#4' })
+
+    // Then each step updates the stored project list cleanly
+    expect(discovered).toMatchObject({
+      ok: true,
+      projects: [{ id: 'PVT_1', number: 4, title: 'Roadmap' }],
+    })
+    expect(added.ok).toBe(true)
+    expect(updated.ok).toBe(true)
+    expect(listed).toMatchObject({
+      ok: true,
+      projects: [{ ownerType: 'organization', owner: 'deepseek-ai', projectNumber: 4, title: 'Roadmap', includeDrafts: false, statusMap: { running: 'Doing' } }],
+    })
+    expect(removed.ok).toBe(true)
+    expect(listProjects()).toEqual([])
   })
 })

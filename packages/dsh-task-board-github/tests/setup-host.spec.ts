@@ -472,3 +472,111 @@ describe('GitHub connection test', () => {
     expect(report.checks[0]?.message).toContain('401')
   })
 })
+
+describe('GitHub host setup projects, discovery, and remote task creation', () => {
+  it('operator discovers orgs/repos/projects, writes projects, creates remote tasks, and triggers sync', async () => {
+    // Given a host setup wired with a FakeGitHubBackend, workspace registry, and settings store
+    const { FakeGitHubBackend } = await import('./support/fake-github.ts')
+    const backend = new FakeGitHubBackend()
+    backend.login = 'octocat'
+    backend.scopes = ['repo', 'read:org', 'project']
+    backend.orgs = [{ login: 'deepseek-ai' }]
+    backend.repositories = [
+      { owner: 'deepseek-ai', name: 'dsh-web', fullName: 'deepseek-ai/dsh-web', private: true, defaultBranch: 'main' },
+    ]
+    backend.projects = [{
+      id: 'PVT_1',
+      number: 7,
+      title: 'Roadmap',
+      url: 'https://github.com/orgs/deepseek-ai/projects/7',
+      ownerType: 'organization',
+      owner: 'deepseek-ai',
+      statusFieldId: 'PVTSSF_1',
+      statusOptions: [
+        { id: 'opt_todo', name: 'Todo' },
+        { id: 'opt_in_progress', name: 'In Progress' },
+      ],
+      items: [],
+    }]
+
+    const credentials = credentialStore({ GITHUB_TOKEN: 'ghp_valid' })
+    const writtenProjects: unknown[] = []
+    let syncTriggered = 0
+    const ctx = {
+      get(name: string) {
+        if (name === 'credentials') return credentials.face
+        if (name === 'settings') {
+          return {
+            writable: true,
+            describe: () => [{ ns: 'task-board-github', value: {}, revision: 1 }],
+            mutate: async (_ns: string, ops: Array<{ value: unknown }>) => { writtenProjects.push(ops[0]?.value) },
+          }
+        }
+        return undefined
+      },
+    } as unknown as import('@deepseek-ai/cordis').Context
+
+    const { createGitHubSetup } = await import('../src/host/setup.ts')
+    const { GitHubApiClient } = await import('../src/host/client.ts')
+    const setup = createGitHubSetup({
+      ctx,
+      repositories: () => [{ owner: 'deepseek-ai', repository: 'dsh-web', inclusionLabel: 'board' }],
+      projects: () => [{ ownerType: 'organization', owner: 'deepseek-ai', projectNumber: 7 }],
+      tokenEnv: () => 'GITHUB_TOKEN',
+      running: () => true,
+      reload: () => {},
+      clientFor: (token) => new GitHubApiClient({ token, fetch: backend.fetch }),
+      workspaceRegistry: () => ({ list: () => [{ id: 'ws-dsh-web', path: '/tmp/dsh-web' }] }),
+      triggerSync: async () => { syncTriggered += 1 },
+      now: () => 123_456,
+    })
+
+    // When writing projects, discovering resources, testing connection, and creating remote tasks
+    const savedProjects = await setup.writeProjects([{ ownerType: 'organization', owner: 'deepseek-ai', projectNumber: 7 }])
+    const orgs = await setup.discoverOrgs()
+    const orgProjects = await setup.discoverProjects({ ownerType: 'organization', owner: 'deepseek-ai' })
+    const orgRepos = await setup.discoverRepositories({ org: 'deepseek-ai' })
+    const report = await setup.test()
+    const issueTask = await setup.createRemoteTask({
+      mode: 'project-issue',
+      owner: 'deepseek-ai',
+      repository: 'dsh-web',
+      projectOwnerType: 'organization',
+      projectOwner: 'deepseek-ai',
+      projectNumber: 7,
+      title: 'Fix auth',
+      body: 'Details',
+      prompt: 'Custom prompt from user',
+      status: 'running',
+      assignees: ['@me'],
+    })
+    const draftTask = await setup.createRemoteTask({
+      mode: 'project-draft',
+      projectOwnerType: 'organization',
+      projectOwner: 'deepseek-ai',
+      projectNumber: 7,
+      title: 'Draft task',
+      status: 'todo',
+    })
+    const synced = await setup.triggerSync()
+
+    // Then projects are saved, scopes/projectChecks are reported, @me & inclusionLabel & workspaceId resolve, and caller prompt omits promptHash
+    expect(savedProjects).toHaveLength(1)
+    expect(writtenProjects).toHaveLength(1)
+    expect(orgs).toEqual([{ login: 'deepseek-ai' }])
+    expect(orgProjects[0]?.title).toBe('Roadmap')
+    expect(orgRepos[0]?.fullName).toBe('deepseek-ai/dsh-web')
+    expect(report.scopes).toEqual(['repo', 'read:org', 'project'])
+    expect(report.projectChecks?.[0]).toMatchObject({ ok: true, title: 'Roadmap' })
+    expect(issueTask.suggestedWorkspaceId).toBe('ws-dsh-web')
+    expect(issueTask.prompt).toBe('Custom prompt from user')
+    expect(issueTask.payload.promptHash).toBeUndefined()
+    expect(issueTask.payload.remoteLabels).toContain('board')
+    expect(issueTask.payload.project?.statusName).toBe('In Progress')
+    expect(backend.issues[0]?.assignees).toEqual([{ login: 'octocat' }])
+    expect(draftTask.payload.project?.isDraft).toBe(true)
+    expect(draftTask.payload.promptHash).toMatch(/^f1:/)
+    expect(synced).toEqual({ ok: true })
+    expect(syncTriggered).toBe(1)
+  })
+})

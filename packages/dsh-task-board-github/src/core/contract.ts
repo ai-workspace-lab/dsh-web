@@ -29,6 +29,8 @@ export const TASK_BOARD_DETAIL_SECTION = 'task-board.detail.section'
 export const TASK_BOARD_SETTINGS_SECTION = 'task-board.settings.section'
 /** Child seat a provider registers its card decoration into. */
 export const TASK_BOARD_CARD_DECORATION = 'task-board.card.decoration'
+/** Child seat a provider registers its task-create backend section into. */
+export const TASK_BOARD_CREATE_SECTION = 'task-board.create.section'
 
 /** One opaque provider payload the board stores without interpreting. */
 export type TaskBoardExtensionPayload = Record<string, unknown>
@@ -207,6 +209,38 @@ export interface TaskBoardSettingsSectionProps {
 /** Owner props of the card-decoration seat. */
 export interface TaskBoardCardDecorationProps {
   task: TaskRecord
+}
+
+/** Draft values currently entered in the board's create-task dialog. */
+export interface TaskBoardCreateBackendDraft {
+  title: string
+  description: string
+  prompt: string
+  status?: TaskStatus
+  workspaceId?: string
+}
+
+/** Result returned by a provider's create-task backend before/instead of local task creation. */
+export interface TaskBoardCreateBackendResult {
+  title?: string
+  description?: string
+  prompt?: string
+  status?: TaskStatus
+  workspaceId?: string
+  payload?: TaskBoardExtensionPayload
+}
+
+/** Active create-task backend selection registered by a provider section. */
+export interface TaskBoardCreateBackendSelection {
+  id: string
+  label: string
+  createTask(draft: TaskBoardCreateBackendDraft): Promise<TaskBoardCreateBackendResult>
+}
+
+/** Owner props of the create-task backend seat. */
+export interface TaskBoardCreateSectionProps {
+  draft: TaskBoardCreateBackendDraft
+  onSelectBackend(selection: TaskBoardCreateBackendSelection | undefined): void
 }
 
 /** Host-half service face published under {@link TASK_BOARD_SERVICE_NAME}. */

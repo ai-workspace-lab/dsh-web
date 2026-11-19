@@ -12,6 +12,13 @@ import {
   sanitizeRepositoryConfig,
   sanitizeRepositoryList,
   updateRepository,
+  addProject,
+  parseProjectInput,
+  projectSlug,
+  removeProject,
+  sanitizeProjectConfig,
+  sanitizeProjectList,
+  updateProject,
 } from '../src/core/setup.ts'
 
 describe('GitHub repository input parsing', () => {
@@ -156,5 +163,66 @@ describe('GitHub repository configuration sanitizing', () => {
     // When its slug is read
     // Then it is the owner-and-name label every surface prints
     expect(repositorySlug({ owner: 'deepseek-ai', repository: 'dsh-web' })).toBe('deepseek-ai/dsh-web')
+  })
+})
+
+describe('GitHub Project v2 parsing and editing', () => {
+  it('operator parses all supported Project v2 URL and shorthand forms', () => {
+    // Given various Project v2 input strings
+    // When parsed with parseProjectInput
+    // Then each resolves to its expected ownerType, owner, and projectNumber
+    expect(parseProjectInput('https://github.com/orgs/deepseek-ai/projects/7')).toEqual({
+      ownerType: 'organization',
+      owner: 'deepseek-ai',
+      projectNumber: 7,
+    })
+    expect(parseProjectInput('https://github.com/users/octocat/projects/3/views/1')).toEqual({
+      ownerType: 'user',
+      owner: 'octocat',
+      projectNumber: 3,
+    })
+    expect(parseProjectInput('org/deepseek-ai/projects/12')).toEqual({
+      ownerType: 'organization',
+      owner: 'deepseek-ai',
+      projectNumber: 12,
+    })
+    expect(parseProjectInput('user/octocat/projects/4')).toEqual({
+      ownerType: 'user',
+      owner: 'octocat',
+      projectNumber: 4,
+    })
+    expect(parseProjectInput('deepseek-ai/projects/9')).toEqual({
+      ownerType: 'organization',
+      owner: 'deepseek-ai',
+      projectNumber: 9,
+    })
+    expect(parseProjectInput('deepseek-ai#15')).toEqual({
+      ownerType: 'organization',
+      owner: 'deepseek-ai',
+      projectNumber: 15,
+    })
+    expect(parseProjectInput('invalid')).toBeUndefined()
+    expect(projectSlug({ ownerType: 'user', owner: 'octocat', projectNumber: 3 })).toBe('user/octocat/projects/3')
+  })
+
+  it('operator adds, updates, removes, and sanitizes Project v2 lists', () => {
+    // Given an empty Project v2 list
+    // When adding, updating, sanitizing, and removing projects
+    const added = addProject([], 'https://github.com/orgs/deepseek-ai/projects/7', { title: 'Roadmap' })
+    expect(added.ok).toBe(true)
+    const list = added.ok ? added.projects : []
+    const dup = addProject(list, 'deepseek-ai#7')
+    const updated = updateProject(list, 'org/deepseek-ai/projects/7', { includeDrafts: false, statusMap: { done: 'Shipped' } })
+    const sanitized = sanitizeProjectConfig({ ownerType: 'organization', owner: ' deepseek-ai ', projectNumber: 7, extra: 1 })
+    const badList = sanitizeProjectList([{ ownerType: 'organization', owner: 'deepseek-ai', projectNumber: 0 }])
+    const removed = removeProject(updated.ok ? updated.projects : list, 'deepseek-ai#7')
+
+    // Then duplicates are refused, updates apply, unknown keys drop, and remove clears the list
+    expect(dup).toMatchObject({ ok: false, code: 'project-duplicate' })
+    expect(updated.ok && updated.projects[0]?.includeDrafts).toBe(false)
+    expect(updated.ok && updated.projects[0]?.statusMap).toEqual({ done: 'Shipped' })
+    expect(sanitized).toEqual({ ownerType: 'organization', owner: 'deepseek-ai', projectNumber: 7 })
+    expect(badList).toBeUndefined()
+    expect(removed).toEqual({ ok: true, projects: [] })
   })
 })

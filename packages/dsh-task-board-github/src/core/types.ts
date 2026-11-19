@@ -71,6 +71,76 @@ export interface GitHubRemoteCloseSync {
   settledStatus?: TaskStatus
 }
 
+/** Owner kind of a GitHub Project v2. */
+export type GitHubProjectOwnerType = 'organization' | 'user'
+
+/** Configured Project v2 Status option names for mapping between board columns and project status. */
+export interface GitHubProjectStatusMap {
+  backlog?: string
+  todo?: string
+  running?: string
+  done?: string
+  failed?: string
+}
+
+/** Configuration for one GitHub Project v2 synchronized with the board. */
+export interface GitHubProjectConfig {
+  /** Whether the project belongs to an organization or a user. */
+  ownerType: GitHubProjectOwnerType
+  /** Organization or user login owning the project. */
+  owner: string
+  /** Project v2 number (as shown in the project URL). */
+  projectNumber: number
+  /** Cached display title of the project. */
+  title?: string
+  /** Background polling interval in ms; 0 or undefined to use default (300_000). */
+  pollingIntervalMs?: number
+  /** Status option name mapping for each board column. */
+  statusMap?: GitHubProjectStatusMap
+  /** Whether DraftIssue items in the project are materialized as board cards (default: true). */
+  includeDrafts?: boolean
+  /** Qualified provider/model for issue analysis on items from this project. */
+  analysisModel?: string
+}
+
+/** Resolved Project v2 configuration with defaults applied. */
+export interface ResolvedGitHubProjectConfig {
+  readonly ownerType: GitHubProjectOwnerType
+  readonly owner: string
+  readonly projectNumber: number
+  readonly title?: string
+  readonly pollingIntervalMs: number
+  readonly statusMap: Required<GitHubProjectStatusMap>
+  readonly includeDrafts: boolean
+  readonly analysisModel?: string
+}
+
+/** Project v2 item provenance stored inside {@link GitHubTaskMetadata.project}. */
+export interface GitHubProjectItemMetadata {
+  /** GraphQL node id of the ProjectV2. */
+  projectId: string
+  /** Project v2 number. */
+  projectNumber: number
+  /** Owner kind ('organization' | 'user'). */
+  ownerType: GitHubProjectOwnerType
+  /** Project owner login. */
+  owner: string
+  /** Project title at last sync. */
+  projectTitle?: string
+  /** GraphQL node id of the ProjectV2Item. */
+  itemId: string
+  /** GraphQL node id of the Status single-select field. */
+  statusFieldId?: string
+  /** GraphQL node id of the current Status option. */
+  statusOptionId?: string
+  /** Display name of the current Status option. */
+  statusName?: string
+  /** True when the project item is a DraftIssue rather than a repository Issue. */
+  isDraft?: boolean
+  /** GraphQL node id of the DraftIssue content, when {@link isDraft} is true. */
+  draftIssueId?: string
+}
+
 /** External provider metadata attached to a task synchronized with GitHub. */
 export interface GitHubTaskMetadata {
   provider: 'github'
@@ -122,6 +192,8 @@ export interface GitHubTaskMetadata {
   analysisPendingSince?: number
   /** Why the last analysis request failed, until the next one starts. */
   analysisError?: string
+  /** GitHub Project v2 item provenance when synced from or attached to a Project. */
+  project?: GitHubProjectItemMetadata
 }
 
 /** Configured state labels for projecting task status into GitHub labels. */
@@ -207,6 +279,38 @@ export const DEFAULT_PR_PHASE_LABEL = 'dsh:phase:pr'
 export const DEFAULT_POLLING_INTERVAL_MS = 300_000
 export const DEFAULT_BASE_BRANCH = 'main'
 
+export const DEFAULT_PROJECT_STATUS_MAP: Required<GitHubProjectStatusMap> = {
+  backlog: 'Backlog',
+  todo: 'Todo',
+  running: 'In Progress',
+  done: 'Done',
+  failed: 'Blocked',
+}
+
+/** Resolve a Project v2 configuration by filling canonical defaults. */
+export function resolveProjectConfig(raw: GitHubProjectConfig): ResolvedGitHubProjectConfig {
+  const title = (raw.title ?? '').trim()
+  const analysisModel = (raw.analysisModel ?? '').trim()
+  return {
+    ownerType: raw.ownerType === 'user' ? 'user' : 'organization',
+    owner: raw.owner.trim(),
+    projectNumber: raw.projectNumber,
+    ...(title === '' ? {} : { title }),
+    pollingIntervalMs: typeof raw.pollingIntervalMs === 'number' && raw.pollingIntervalMs >= 0
+      ? raw.pollingIntervalMs
+      : DEFAULT_POLLING_INTERVAL_MS,
+    statusMap: {
+      backlog: raw.statusMap?.backlog?.trim() || DEFAULT_PROJECT_STATUS_MAP.backlog,
+      todo: raw.statusMap?.todo?.trim() || DEFAULT_PROJECT_STATUS_MAP.todo,
+      running: raw.statusMap?.running?.trim() || DEFAULT_PROJECT_STATUS_MAP.running,
+      done: raw.statusMap?.done?.trim() || DEFAULT_PROJECT_STATUS_MAP.done,
+      failed: raw.statusMap?.failed?.trim() || DEFAULT_PROJECT_STATUS_MAP.failed,
+    },
+    includeDrafts: raw.includeDrafts !== false,
+    ...(analysisModel === '' ? {} : { analysisModel }),
+  }
+}
+
 /** Resolve a repository configuration by filling canonical defaults. */
 export function resolveRepoConfig(raw: GitHubRepoConfig): ResolvedGitHubRepoConfig {
   const prefix = (raw.managedLabelPrefix ?? DEFAULT_MANAGED_LABEL_PREFIX).trim()
@@ -249,14 +353,32 @@ export function assigneeOf(value: string | undefined): string | undefined {
   return trimmed === '' ? undefined : trimmed.toLowerCase()
 }
 
+function isValidProjectMetadata(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const p = value as Record<string, unknown>
+  if (typeof p.projectId !== 'string' || p.projectId.trim() === '') return false
+  if (typeof p.projectNumber !== 'number' || !Number.isInteger(p.projectNumber) || p.projectNumber <= 0) return false
+  if (p.ownerType !== 'organization' && p.ownerType !== 'user') return false
+  if (typeof p.owner !== 'string' || p.owner.trim() === '') return false
+  if (typeof p.itemId !== 'string' || p.itemId.trim() === '') return false
+  return true
+}
+
 /** Validate whether a value is a structural GitHubTaskMetadata object. */
 export function isGitHubTaskMetadata(value: unknown): value is GitHubTaskMetadata {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
   const gh = value as Record<string, unknown>
   if (gh.provider !== 'github') return false
   if (typeof gh.owner !== 'string' || gh.owner.trim() === '') return false
-  if (typeof gh.repository !== 'string' || gh.repository.trim() === '') return false
-  if (typeof gh.issueNumber !== 'number' || !Number.isInteger(gh.issueNumber) || gh.issueNumber <= 0) return false
+  if (gh.project !== undefined && !isValidProjectMetadata(gh.project)) return false
+  const isDraft = gh.project !== undefined && (gh.project as Record<string, unknown>).isDraft === true
+  if (isDraft) {
+    if (gh.repository !== '') return false
+    if (gh.issueNumber !== 0) return false
+  } else {
+    if (typeof gh.repository !== 'string' || gh.repository.trim() === '') return false
+    if (typeof gh.issueNumber !== 'number' || !Number.isInteger(gh.issueNumber) || gh.issueNumber <= 0) return false
+  }
   if (typeof gh.issueUrl !== 'string' || gh.issueUrl.trim() === '') return false
   if (!Array.isArray(gh.remoteLabels) || !gh.remoteLabels.every(l => typeof l === 'string')) return false
   if (gh.remoteState !== undefined && gh.remoteState !== 'open' && gh.remoteState !== 'closed') return false
@@ -297,6 +419,24 @@ function normalizeRemoteClose(value: unknown): GitHubTaskMetadata['remoteClose']
   }
 }
 
+function normalizeProjectMetadata(value: unknown): GitHubProjectItemMetadata | undefined {
+  if (!isValidProjectMetadata(value)) return undefined
+  const raw = value as GitHubProjectItemMetadata & Record<string, unknown>
+  return {
+    projectId: raw.projectId.trim(),
+    projectNumber: raw.projectNumber,
+    ownerType: raw.ownerType,
+    owner: raw.owner.trim(),
+    itemId: raw.itemId.trim(),
+    ...(typeof raw.projectTitle === 'string' && raw.projectTitle.trim() !== '' ? { projectTitle: raw.projectTitle.trim() } : {}),
+    ...(typeof raw.statusFieldId === 'string' && raw.statusFieldId.trim() !== '' ? { statusFieldId: raw.statusFieldId.trim() } : {}),
+    ...(typeof raw.statusOptionId === 'string' && raw.statusOptionId.trim() !== '' ? { statusOptionId: raw.statusOptionId.trim() } : {}),
+    ...(typeof raw.statusName === 'string' && raw.statusName.trim() !== '' ? { statusName: raw.statusName.trim() } : {}),
+    ...(raw.isDraft === true ? { isDraft: true } : {}),
+    ...(typeof raw.draftIssueId === 'string' && raw.draftIssueId.trim() !== '' ? { draftIssueId: raw.draftIssueId.trim() } : {}),
+  }
+}
+
 export function normalizeGitHubMetadata(value: unknown): GitHubTaskMetadata | undefined {
   if (!isGitHubTaskMetadata(value)) return undefined
   const gh = value as GitHubTaskMetadata & Record<string, unknown>
@@ -316,6 +456,7 @@ export function normalizeGitHubMetadata(value: unknown): GitHubTaskMetadata | un
 
   const analysis = normalizeStoredAnalysis(gh.analysis)
   const remoteClose = normalizeRemoteClose(gh.remoteClose)
+  const project = normalizeProjectMetadata(gh.project)
 
   return {
     provider: 'github',
@@ -338,6 +479,7 @@ export function normalizeGitHubMetadata(value: unknown): GitHubTaskMetadata | un
     ...(analysis !== undefined ? { analysis } : {}),
     ...(typeof gh.analysisPendingSince === 'number' && Number.isFinite(gh.analysisPendingSince) ? { analysisPendingSince: gh.analysisPendingSince } : {}),
     ...(typeof gh.analysisError === 'string' && gh.analysisError !== '' ? { analysisError: gh.analysisError } : {}),
+    ...(project !== undefined ? { project } : {}),
   }
 }
 
@@ -402,4 +544,73 @@ export interface GitHubPullRequestPayload {
   merged_at?: string | null
   head: { ref: string }
   base: { ref: string }
+}
+
+/** Wire payload for a GitHub organization summary. */
+export interface GitHubOrganizationSummary {
+  login: string
+  name?: string | null
+  avatarUrl?: string
+}
+
+/** Wire payload for a discovered GitHub repository summary. */
+export interface GitHubRemoteRepositorySummary {
+  owner: string
+  name: string
+  fullName: string
+  private: boolean
+  defaultBranch?: string
+  description?: string | null
+  htmlUrl?: string
+}
+
+/** Wire payload for a discovered GitHub Project v2 summary. */
+export interface GitHubRemoteProjectSummary {
+  id: string
+  number: number
+  title: string
+  url: string
+  ownerType: GitHubProjectOwnerType
+  owner: string
+  closed?: boolean
+}
+
+/** One option in a Project v2 Status single-select field. */
+export interface GitHubProjectStatusOption {
+  id: string
+  name: string
+}
+
+/** One item inside a Project v2 GraphQL response, normalized for projection. */
+export interface GitHubProjectItemPayload {
+  itemId: string
+  statusOptionId?: string
+  statusName?: string
+  updatedAt?: string
+  contentType: 'Issue' | 'DraftIssue' | 'PullRequest'
+  isDraft: boolean
+  draftIssueId?: string
+  issueNumber?: number
+  issueNodeId?: string
+  owner?: string
+  repository?: string
+  title: string
+  body?: string
+  state?: 'open' | 'closed'
+  url: string
+  labels?: string[]
+  assignees?: string[]
+}
+
+/** Full Project v2 detail payload including Status field options and items. */
+export interface GitHubProjectDetailPayload {
+  id: string
+  number: number
+  title: string
+  url: string
+  ownerType: GitHubProjectOwnerType
+  owner: string
+  statusFieldId?: string
+  statusOptions: GitHubProjectStatusOption[]
+  items: GitHubProjectItemPayload[]
 }

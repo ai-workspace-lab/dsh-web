@@ -130,6 +130,7 @@ export function registerTaskBoardPanel(ctx: ClientContext, controller: BoardCont
     children: {
       'task-board.detail.section': { kind: 'list', scope: 'root' },
       'task-board.card.decoration': { kind: 'list', scope: 'root' },
+      'task-board.create.section': { kind: 'list', scope: 'root' },
     },
     inject: (): PanelFace => ({ controller }),
   }, TaskBoardPanel as never)))

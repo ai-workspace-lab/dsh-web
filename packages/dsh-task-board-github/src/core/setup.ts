@@ -12,7 +12,15 @@
  *
  * @module dsh-task-board-github/core/setup
  */
-import type { GitHubRepoConfig, GitHubStateLabels } from './types.ts'
+import type { TaskStatus } from './task-record.ts'
+import type {
+  GitHubProjectConfig,
+  GitHubProjectOwnerType,
+  GitHubProjectStatusMap,
+  GitHubRepoConfig,
+  GitHubStateLabels,
+  GitHubTaskMetadata,
+} from './types.ts'
 
 /**
  * Same-origin route prefix of this extension's setup API, written the way the
@@ -141,6 +149,10 @@ export interface GitHubSetupSummary {
   credential: GitHubCredentialStatus
   /** Repositories the running configuration serves, defaults applied. */
   repositories: GitHubRepoConfig[]
+  /** GitHub Projects v2 the running configuration serves. */
+  projects: GitHubProjectConfig[]
+  /** Configured OAuth App client id, when overridden. */
+  oauthClientId?: string
   /** Whether the provider itself is mounted (board and extension both on). */
   running: boolean
   /** Whether the settings document accepts configuration writes at all. */
@@ -200,16 +212,87 @@ export interface GitHubRepositoryCheck {
   includeUnassigned?: boolean
 }
 
+/** One Project v2's outcome in a connection test. */
+export interface GitHubProjectCheck {
+  ownerType: GitHubProjectOwnerType
+  owner: string
+  projectNumber: number
+  ok: boolean
+  message: string
+  title?: string
+  itemCount?: number
+}
+
 /** Outcome of one live connection test. */
 export interface GitHubConnectionReport {
   /** Whether the credential authenticated and every checked repository answered. */
   ok: boolean
   /** Login of the authenticated account, when the credential authenticated at all. */
   login?: string
+  /** OAuth scopes reported by GitHub for this token, when available. */
+  scopes?: string[]
   /** Credential facts at the time of the test. */
   credential: GitHubCredentialStatus
   /** One entry per checked repository. */
   checks: GitHubRepositoryCheck[]
+  /** One entry per checked Project v2. */
+  projectChecks?: GitHubProjectCheck[]
+}
+
+/** Public device-flow start payload returned to the browser (never includes device_code). */
+export interface GitHubDeviceFlowStart {
+  flowId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  expiresIn: number
+  interval: number
+}
+
+/** Result of polling one active OAuth device flow. */
+export type GitHubDeviceFlowPollResult =
+  | { status: 'pending'; interval?: number }
+  | { status: 'authorized'; login?: string; scopes?: string[]; summary: GitHubSetupSummary }
+  | { status: 'expired' | 'denied' | 'cancelled' | 'error'; message: string }
+
+/** Outcome of importing an existing local credential (e.g. gh CLI or dsh-connectors). */
+export interface GitHubLocalAuthImportResult {
+  ok: boolean
+  source?: 'gh-cli' | 'dsh-connectors'
+  login?: string
+  scopes?: string[]
+  summary?: GitHubSetupSummary
+  message?: string
+}
+
+/** Backend mode when creating a remote GitHub item from the task-create dialog. */
+export type GitHubCreateBackendMode = 'issue' | 'project-issue' | 'project-draft'
+
+/** Request to create a remote GitHub Issue and/or Project v2 item. */
+export interface GitHubCreateRemoteTaskRequest {
+  mode: GitHubCreateBackendMode
+  owner?: string
+  repository?: string
+  projectOwnerType?: GitHubProjectOwnerType
+  projectOwner?: string
+  projectNumber?: number
+  title: string
+  body?: string
+  prompt?: string
+  status?: TaskStatus
+  labels?: string[]
+  assignees?: string[]
+}
+
+/** Response from creating a remote GitHub Issue and/or Project v2 item. */
+export interface GitHubCreateRemoteTaskResponse {
+  title: string
+  description: string
+  prompt: string
+  status?: TaskStatus
+  payload: GitHubTaskMetadata
+  suggestedPrompt: string
+  suggestedWorkspaceId?: string
 }
 
 /** Owner and name of one repository, as parsed from user input. */
@@ -480,5 +563,210 @@ export function updateRepository(list: readonly GitHubRepoConfig[], input: strin
   return {
     ok: true,
     repositories: list.map(entry => identityOf(entry) === key ? withOptions(entry, options) : { ...entry }),
+  }
+}
+
+/** Owner kind, login, and project number of one Project v2, as parsed from user input. */
+export interface ParsedProject {
+  ownerType: GitHubProjectOwnerType
+  owner: string
+  projectNumber: number
+}
+
+function checkProject(ownerType: GitHubProjectOwnerType, owner: string, rawNumber: string): ParsedProject | undefined {
+  if (!SEGMENT.test(owner)) return undefined
+  if (!/^\d+$/.test(rawNumber)) return undefined
+  const projectNumber = Number(rawNumber)
+  if (!Number.isSafeInteger(projectNumber) || projectNumber <= 0) return undefined
+  return { ownerType, owner, projectNumber }
+}
+
+/**
+ * Parse Project v2 text entered by a user or model.
+ *
+ * Accepts:
+ * - `https://github.com/orgs/<org>/projects/<num>`
+ * - `https://github.com/users/<user>/projects/<num>`
+ * - `org/<owner>/projects/<num>` (or `orgs/...`)
+ * - `user/<owner>/projects/<num>` (or `users/...`)
+ * - `<owner>/projects/<num>`
+ * - `<owner>#<num>`
+ */
+export function parseProjectInput(input: string): ParsedProject | undefined {
+  const textInput = input.trim()
+  if (textInput === '') return undefined
+
+  const urlMatch = /^(?:https?:\/\/)?[^/\s]+\/(orgs|users)\/([^/\s]+)\/projects\/(\d+)(?:[/?#].*)?$/i.exec(textInput)
+  if (urlMatch !== null) {
+    const ownerType: GitHubProjectOwnerType = urlMatch[1]!.toLowerCase() === 'users' ? 'user' : 'organization'
+    return checkProject(ownerType, urlMatch[2]!, urlMatch[3]!)
+  }
+
+  const typedMatch = /^(orgs?|users?)\/([^/\s]+)\/projects\/(\d+)$/i.exec(textInput)
+  if (typedMatch !== null) {
+    const prefix = typedMatch[1]!.toLowerCase()
+    const ownerType: GitHubProjectOwnerType = prefix.startsWith('user') ? 'user' : 'organization'
+    return checkProject(ownerType, typedMatch[2]!, typedMatch[3]!)
+  }
+
+  const slashMatch = /^([^/\s]+)\/projects\/(\d+)$/i.exec(textInput)
+  if (slashMatch !== null) {
+    return checkProject('organization', slashMatch[1]!, slashMatch[2]!)
+  }
+
+  const hashMatch = /^([^/#\s]+)#(\d+)$/.exec(textInput)
+  if (hashMatch !== null) {
+    return checkProject('organization', hashMatch[1]!, hashMatch[2]!)
+  }
+
+  return undefined
+}
+
+/** Canonical slug label of one Project v2. */
+export function projectSlug(project: { ownerType: GitHubProjectOwnerType; owner: string; projectNumber: number }): string {
+  const prefix = project.ownerType === 'user' ? 'user' : 'org'
+  return `${prefix}/${project.owner}/projects/${String(project.projectNumber)}`
+}
+
+/** Copy known status-map overrides out of an unknown value. */
+function sanitizeProjectStatusMap(value: unknown): GitHubProjectStatusMap | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const map: GitHubProjectStatusMap = {}
+  for (const key of ['backlog', 'todo', 'running', 'done', 'failed'] as const) {
+    const option = text(raw[key])
+    if (option !== undefined) map[key] = option
+  }
+  return Object.keys(map).length > 0 ? map : undefined
+}
+
+/** Sanitize one Project v2 configuration arriving from wire or settings. */
+export function sanitizeProjectConfig(value: unknown): GitHubProjectConfig | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  if (raw.ownerType !== 'organization' && raw.ownerType !== 'user') return undefined
+  const owner = typeof raw.owner === 'string' ? raw.owner.trim() : ''
+  if (!SEGMENT.test(owner)) return undefined
+  const projectNumber = raw.projectNumber
+  if (typeof projectNumber !== 'number' || !Number.isInteger(projectNumber) || projectNumber <= 0) return undefined
+
+  const config: GitHubProjectConfig = {
+    ownerType: raw.ownerType,
+    owner,
+    projectNumber,
+  }
+  const title = text(raw.title)
+  if (title !== undefined) config.title = title
+  if (typeof raw.pollingIntervalMs === 'number' && Number.isFinite(raw.pollingIntervalMs) && raw.pollingIntervalMs >= 0) {
+    config.pollingIntervalMs = Math.floor(raw.pollingIntervalMs)
+  }
+  const statusMap = sanitizeProjectStatusMap(raw.statusMap)
+  if (statusMap !== undefined) config.statusMap = statusMap
+  if (typeof raw.includeDrafts === 'boolean') config.includeDrafts = raw.includeDrafts
+  const analysisModel = text(raw.analysisModel)
+  if (analysisModel !== undefined) config.analysisModel = analysisModel
+  return config
+}
+
+/** Sanitize a whole Project v2 list (all-or-nothing). */
+export function sanitizeProjectList(value: unknown): GitHubProjectConfig[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const list: GitHubProjectConfig[] = []
+  for (const entry of value) {
+    const config = sanitizeProjectConfig(entry)
+    if (config === undefined) return undefined
+    list.push(config)
+  }
+  return list
+}
+
+/** Optional per-project fields an edit may set. */
+export interface ProjectOptions {
+  title?: string
+  pollingIntervalMs?: number
+  statusMap?: GitHubProjectStatusMap
+  includeDrafts?: boolean
+  analysisModel?: string
+}
+
+/** Outcome of one Project list edit. */
+export type ProjectEditResult =
+  | { ok: true; projects: GitHubProjectConfig[] }
+  | { ok: false; code: string; message: string }
+
+function projectIdentityOf(project: { ownerType: GitHubProjectOwnerType; owner: string; projectNumber: number }): string {
+  return `${project.ownerType}:${project.owner.toLowerCase()}#${String(project.projectNumber)}`
+}
+
+function withProjectOptions(base: GitHubProjectConfig, options: ProjectOptions): GitHubProjectConfig {
+  const next: GitHubProjectConfig = { ...base }
+  if (options.title !== undefined) {
+    const title = options.title.trim()
+    if (title === '') delete next.title
+    else next.title = title
+  }
+  if (options.pollingIntervalMs !== undefined && Number.isFinite(options.pollingIntervalMs) && options.pollingIntervalMs >= 0) {
+    next.pollingIntervalMs = Math.floor(options.pollingIntervalMs)
+  }
+  if (options.statusMap !== undefined) {
+    const sanitized = sanitizeProjectStatusMap(options.statusMap)
+    if (sanitized === undefined) delete next.statusMap
+    else next.statusMap = sanitized
+  }
+  if (options.includeDrafts !== undefined) next.includeDrafts = options.includeDrafts
+  if (options.analysisModel !== undefined) {
+    const analysisModel = options.analysisModel.trim()
+    if (analysisModel === '') delete next.analysisModel
+    else next.analysisModel = analysisModel
+  }
+  return next
+}
+
+/** Add one Project v2 to the configured list. */
+export function addProject(list: readonly GitHubProjectConfig[], input: string, options: ProjectOptions = {}): ProjectEditResult {
+  const parsed = parseProjectInput(input)
+  if (parsed === undefined) {
+    return {
+      ok: false,
+      code: 'project-invalid',
+      message: '"' + input.trim() + '" is not a GitHub Project v2; use org/<owner>/projects/<num>, <owner>#<num>, or paste its URL',
+    }
+  }
+  const key = projectIdentityOf(parsed)
+  if (list.some(entry => projectIdentityOf(entry) === key)) {
+    return { ok: false, code: 'project-duplicate', message: projectSlug(parsed) + ' is already configured' }
+  }
+  return { ok: true, projects: [...list.map(entry => ({ ...entry })), withProjectOptions({ ...parsed }, options)] }
+}
+
+/** Remove one Project v2 from the configured list. */
+export function removeProject(list: readonly GitHubProjectConfig[], input: string): ProjectEditResult {
+  const parsed = parseProjectInput(input)
+  if (parsed === undefined) {
+    return { ok: false, code: 'project-invalid', message: '"' + input.trim() + '" is not a GitHub Project v2' }
+  }
+  const key = projectIdentityOf(parsed)
+  if (!list.some(entry => projectIdentityOf(entry) === key)) {
+    return { ok: false, code: 'project-absent', message: projectSlug(parsed) + ' is not configured' }
+  }
+  return { ok: true, projects: list.filter(entry => projectIdentityOf(entry) !== key).map(entry => ({ ...entry })) }
+}
+
+/** Change optional fields of one configured Project v2. */
+export function updateProject(list: readonly GitHubProjectConfig[], input: string, options: ProjectOptions): ProjectEditResult {
+  const parsed = parseProjectInput(input)
+  if (parsed === undefined) {
+    return { ok: false, code: 'project-invalid', message: '"' + input.trim() + '" is not a GitHub Project v2' }
+  }
+  if (Object.keys(options).length === 0) {
+    return { ok: false, code: 'nothing-to-update', message: 'name at least one field to change' }
+  }
+  const key = projectIdentityOf(parsed)
+  if (!list.some(entry => projectIdentityOf(entry) === key)) {
+    return { ok: false, code: 'project-absent', message: projectSlug(parsed) + ' is not configured' }
+  }
+  return {
+    ok: true,
+    projects: list.map(entry => projectIdentityOf(entry) === key ? withProjectOptions(entry, options) : { ...entry }),
   }
 }

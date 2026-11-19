@@ -45,6 +45,8 @@ describe('task-board GitHub extension configuration', () => {
     expect(readConfigField(resolved.announceToAgent, true)).toBe(false)
     expect(settings.tokenEnv).toBe(DEFAULT_TOKEN_ENV)
     expect(settings.repositories).toEqual([])
+    expect(settings.projects).toEqual([])
+    expect(settings.oauthClientId).toBe('')
     // And it proxies the way an unconfigured host already behaved: follow the
     // environment, then the system proxy
     expect(settings.proxyMode).toBe('auto')
@@ -89,7 +91,16 @@ describe('task-board GitHub extension configuration', () => {
     for (const [field, node] of Object.entries(dict)) {
       expect(node.meta?.volatile, field).toBe(true)
     }
-    expect(Object.keys(dict).sort()).toEqual(['announceToAgent', 'enabled', 'proxyMode', 'proxyUrl', 'repositories', 'tokenEnv'])
+    expect(Object.keys(dict).sort()).toEqual([
+      'announceToAgent',
+      'enabled',
+      'oauthClientId',
+      'projects',
+      'proxyMode',
+      'proxyUrl',
+      'repositories',
+      'tokenEnv',
+    ])
   })
 
   it('operator reading the published package identity gets the bundle this patch names', () => {

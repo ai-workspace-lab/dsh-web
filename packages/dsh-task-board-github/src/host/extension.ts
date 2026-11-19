@@ -16,7 +16,12 @@ import {
 } from '../core/contract.ts'
 import type { HostTimerFace } from '../core/timers.ts'
 import type { WorkspaceRegistryFace } from './service.ts'
-import { GITHUB_EXTENSION_ID, type GitHubRepoConfig } from '../core/types.ts'
+import {
+  GITHUB_EXTENSION_ID,
+  type GitHubProjectConfig,
+  type GitHubProjectOwnerType,
+  type GitHubRepoConfig,
+} from '../core/types.ts'
 import type { IssueAnalyzer } from './analysis.ts'
 import { GitHubApiClient, proxyClientOptions } from './client.ts'
 import { GitHubSyncService } from './service.ts'
@@ -28,6 +33,7 @@ export { GITHUB_EXTENSION_ID }
 
 export interface GitHubExtensionOptions {
   repositories?: GitHubRepoConfig[]
+  projects?: GitHubProjectConfig[]
   client?: GitHubApiClient
   /**
    * Resolved credential the client authenticates with. The host half resolves
@@ -128,6 +134,7 @@ export function createGitHubExtension(options: GitHubExtensionOptions = {}): Tas
         ...proxyClientOptions(options.proxy?.()),
       }),
       repositories: options.repositories,
+      projects: options.projects,
       timers: options.timers,
       now: options.now,
       credential: options.credential,
@@ -163,7 +170,7 @@ export function createGitHubExtension(options: GitHubExtensionOptions = {}): Tas
           // A provider-side bookkeeping failure must not disturb the board.
         }
       }))
-      for (const tool of [...buildGitHubTools(sync), ...buildSetupTools(options.setup)]) {
+      for (const tool of [...buildGitHubTools(sync, options.setup), ...buildSetupTools(options.setup)]) {
         try {
           disposers.push(host.registerTool(tool))
         } catch {
@@ -197,6 +204,14 @@ export function createGitHubExtension(options: GitHubExtensionOptions = {}): Tas
           }
           const owner = stringField(request, 'owner')
           const repository = stringField(request, 'repository')
+          const projectNumber = numberField(request, 'projectNumber')
+          if (owner !== undefined && projectNumber !== undefined && Number.isInteger(projectNumber) && projectNumber > 0) {
+            const ownerTypeRaw = stringField(request, 'ownerType')
+            const ownerType: GitHubProjectOwnerType = ownerTypeRaw === 'user' ? 'user' : 'organization'
+            const result = await service.syncProject(ownerType, owner, projectNumber)
+            if (result.errors.length > 0) throw new Error(result.errors.join('; '))
+            return { ok: true, synced: result.synced }
+          }
           const result = owner !== undefined && repository !== undefined
             ? await service.syncRepository(owner, repository)
             : await service.syncAll()

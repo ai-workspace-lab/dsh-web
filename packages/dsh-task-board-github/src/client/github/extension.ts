@@ -26,10 +26,13 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import {
   resolveTaskBoardClientFace,
   TASK_BOARD_CARD_DECORATION,
+  TASK_BOARD_CREATE_SECTION,
   TASK_BOARD_DETAIL_SECTION,
   TASK_BOARD_SETTINGS_SECTION,
 } from '../../core/contract.ts'
 import { GITHUB_EXTENSION_ID } from '../../core/types.ts'
+import type { GitHubSetupApi } from '../setup-api.ts'
+import { GitHubCreateBackendSection, setCreateBackendApi } from './create-backend.tsx'
 import { GitHubCardDecoration, GitHubDetailSection } from './sections.tsx'
 import { acceptPublishedSummaries, clearSummary } from './summary.ts'
 import { isGitHubTaskVisible } from './visibility.ts'
@@ -72,7 +75,9 @@ export function installGitHubClientHalf(
   ctx: ClientContext,
   source: ExtensionEnabledSource,
   settings?: GitHubSettingsSectionSeat,
+  setupApi?: GitHubSetupApi,
 ): () => void {
+  if (setupApi !== undefined) setCreateBackendApi(setupApi)
   /** The dependency-scoped fiber that owns the seats, while both gates are on. */
   let injection: ReturnType<ClientContext['inject']> | undefined
   /** The fiber that owns the board's provider-settings section, independent of the switch. */
@@ -208,6 +213,7 @@ function installSeats(ctx: ClientContext): () => void {
     try {
       seats.push(slots.register({ name: TASK_BOARD_DETAIL_SECTION, id: GITHUB_EXTENSION_ID, locale: LOCALE_NS }, GitHubDetailSection as never))
       seats.push(slots.register({ name: TASK_BOARD_CARD_DECORATION, id: GITHUB_EXTENSION_ID }, GitHubCardDecoration as never))
+      seats.push(slots.register({ name: TASK_BOARD_CREATE_SECTION, id: GITHUB_EXTENSION_ID, locale: LOCALE_NS }, GitHubCreateBackendSection as never))
     } catch (error) {
       console.error('[dsh-task-board-github] seat registration failed', error)
     }

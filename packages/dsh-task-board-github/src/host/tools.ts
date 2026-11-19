@@ -10,9 +10,21 @@
  */
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { addRepository, removeRepository, updateRepository, type RepositoryOptions } from '../core/setup.ts'
-import { readTaskGitHubMetadata, type GitHubTaskMetadata } from '../core/types.ts'
-import type { TaskRecord } from '../core/task-record.ts'
+import {
+  addProject,
+  addRepository,
+  parseProjectInput,
+  parseRepositoryInput,
+  removeProject,
+  removeRepository,
+  updateProject,
+  updateRepository,
+  type GitHubCreateBackendMode,
+  type ProjectOptions,
+  type RepositoryOptions,
+} from '../core/setup.ts'
+import { readTaskGitHubMetadata, type GitHubProjectStatusMap, type GitHubTaskMetadata } from '../core/types.ts'
+import type { TaskRecord, TaskStatus } from '../core/task-record.ts'
 import type { GitHubSyncService } from './service.ts'
 import { GitHubSetupError, type GitHubSetup } from './setup.ts'
 
@@ -55,6 +67,7 @@ function githubIssueSummary(gh: GitHubTaskMetadata): Record<string, unknown> {
     ...(gh.lastSyncError === undefined ? {} : { lastSyncError: gh.lastSyncError }),
     ...(gh.deactivated === undefined ? {} : { deactivated: gh.deactivated }),
     ...(gh.pullRequest === undefined ? {} : { pullRequest: gh.pullRequest }),
+    ...(gh.project === undefined ? {} : { project: gh.project }),
   }
 }
 
@@ -70,7 +83,7 @@ function githubTaskSummary(task: TaskRecord): Record<string, unknown> {
 }
 
 /** Every GitHub tool, bound to the running sync service. */
-export function buildGitHubTools(service: GitHubSyncService): ToolDefinition[] {
+export function buildGitHubTools(service: GitHubSyncService, setup?: GitHubSetup): ToolDefinition[] {
   return [
     buildListTool(service),
     buildGetTool(service),
@@ -79,6 +92,7 @@ export function buildGitHubTools(service: GitHubSyncService): ToolDefinition[] {
     buildLinkPrTool(service),
     buildCommentTool(service),
     buildCloseIssueTool(service),
+    ...(setup === undefined ? [] : [buildCreateTaskTool(service, setup)]),
   ]
 }
 
@@ -97,15 +111,15 @@ export function buildGitHubTools(service: GitHubSyncService): ToolDefinition[] {
  */
 export function buildSetupTools(setup: GitHubSetup | undefined): ToolDefinition[] {
   if (setup === undefined) return []
-  return [buildSetupTool(setup), buildRepositoriesTool(setup)]
+  return [buildSetupTool(setup), buildRepositoriesTool(setup), buildProjectsTool(setup)]
 }
 
 function buildSetupTool(setup: GitHubSetup): ToolDefinition {
   return defineTool({
     name: 'task_board_github_setup',
-    description: 'Configure the task board GitHub Issues integration: read the setup status, store or clear the GitHub token, and run a live connection test against GitHub. The token is stored host-side in the harness credential store and is never returned by any tool. Because a token passed as an argument becomes part of this conversation, prefer asking the user to paste it in the extension settings card when they can reach it.',
+    description: 'Configure the task board GitHub Issues & Projects integration: read the setup status, store or clear the GitHub token, import local auth from dsh-connectors or gh CLI, discover account organizations, and run a live connection test against GitHub. The token is stored host-side in the harness credential store and is never returned by any tool. Because a token passed as an argument becomes part of this conversation, prefer asking the user to paste it in the extension settings card when they can reach it.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['status', 'set-token', 'clear-token', 'test'], description: 'status reads the current configuration; set-token stores the token; clear-token removes it; test calls GitHub.' },
+      action: { type: 'string', required: true, enum: ['status', 'set-token', 'clear-token', 'test', 'import-local-auth', 'discover'], description: 'status reads the current configuration; set-token stores the token; clear-token removes it; test calls GitHub; import-local-auth imports a local credential from dsh-connectors or gh CLI; discover tests the credential and lists accessible organizations and configured targets.' },
       token: { type: 'string', description: 'GitHub token to store; required by set-token. It becomes part of this conversation.' },
       owner: { type: 'string', description: 'Repository owner to test only that repository.' },
       repository: { type: 'string', description: 'Repository name to test only that repository.' },
@@ -130,8 +144,22 @@ function buildSetupTool(setup: GitHubSetup): ToolDefinition {
               : {}
             return json({ ok: true, report: await setup.test(target) })
           }
+          case 'import-local-auth':
+            return json(await setup.importLocalAuth())
+          case 'discover': {
+            const report = await setup.test({})
+            const organizations = await setup.discoverOrgs()
+            return json({
+              ok: true,
+              account: report.login ?? null,
+              scopes: report.scopes ?? [],
+              organizations,
+              configuredProjects: setup.listProjects(),
+              configuredRepositories: setup.listRepositories(),
+            })
+          }
           default:
-            return refused('unknown-action', 'action must be status, set-token, clear-token or test')
+            return refused('unknown-action', 'action must be status, set-token, clear-token, test, import-local-auth or discover')
         }
       } catch (error) {
         return refused(error instanceof GitHubSetupError ? error.code : 'setup-failed', describeSetupError(error))
@@ -196,6 +224,88 @@ function buildRepositoriesTool(setup: GitHubSetup): ToolDefinition {
 /** Phrase one setup failure for a model reading a tool result. */
 function describeSetupError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function buildProjectsTool(setup: GitHubSetup): ToolDefinition {
+  return defineTool({
+    name: 'task_board_github_projects',
+    description: 'Read, discover, and edit GitHub Projects v2 synchronized with the task board. Projects sync Issues and DraftIssues into board cards and write column changes back to the Project Status field.',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['list', 'add', 'remove', 'update', 'discover'], description: 'list reads configured projects; discover queries GitHub for accessible Projects v2; add, remove and update edit the configured list.' },
+      project: { type: 'string', description: 'Project v2 reference: GitHub Project URL, org/<owner>/projects/<n>, user/<owner>/projects/<n>, <owner>/projects/<n>, or <owner>#<n>. Required by add, remove and update.' },
+      ownerType: { type: 'string', enum: ['organization', 'user'], description: 'Owner kind for discover (organization or user).' },
+      owner: { type: 'string', description: 'Organization or user login for discover.' },
+      title: { type: 'string', description: 'Optional display title for the project.' },
+      includeDrafts: { type: 'boolean', description: 'Whether DraftIssue items in the project are materialized as board cards (default: true).' },
+      pollingIntervalMs: { type: 'number', description: 'Background polling interval in milliseconds (default 300000; 0 disables polling).' },
+      analysisModel: { type: 'string', description: 'Qualified provider/model for AI issue analysis on items from this project.' },
+      statusMap: {
+        type: 'object',
+        description: 'Optional mapping from board columns (backlog, todo, running, done, failed) to Project Status option names.',
+        additionalProperties: false,
+        properties: {
+          backlog: { type: 'string' },
+          todo: { type: 'string' },
+          running: { type: 'string' },
+          done: { type: 'string' },
+          failed: { type: 'string' },
+        },
+      },
+    },
+    output: { schema: { type: 'json' }, render: renderJson },
+    async execute(args) {
+      const current = setup.listProjects()
+      if (args.action === 'list') return json({ ok: true, projects: current })
+      if (args.action === 'discover') {
+        try {
+          const ownerType = args.ownerType === 'user' || args.ownerType === 'organization' ? args.ownerType : undefined
+          const owner = typeof args.owner === 'string' && args.owner.trim() !== '' ? args.owner.trim() : undefined
+          const projects = await setup.discoverProjects({
+            ...(ownerType !== undefined ? { ownerType } : {}),
+            ...(owner !== undefined ? { owner } : {}),
+          })
+          return json({ ok: true, projects })
+        } catch (error) {
+          return refused(error instanceof GitHubSetupError ? error.code : 'discover-failed', describeSetupError(error))
+        }
+      }
+
+      const input = typeof args.project === 'string' ? args.project : ''
+      const options: ProjectOptions = {}
+      if (typeof args.title === 'string') options.title = args.title.trim()
+      if (typeof args.includeDrafts === 'boolean') options.includeDrafts = args.includeDrafts
+      if (typeof args.pollingIntervalMs === 'number' && Number.isFinite(args.pollingIntervalMs) && args.pollingIntervalMs >= 0) {
+        options.pollingIntervalMs = Math.floor(args.pollingIntervalMs)
+      }
+      if (typeof args.analysisModel === 'string') options.analysisModel = args.analysisModel.trim()
+      if (typeof args.statusMap === 'object' && args.statusMap !== null && !Array.isArray(args.statusMap)) {
+        const raw = args.statusMap as Record<string, unknown>
+        const statusMap: GitHubProjectStatusMap = {}
+        for (const key of ['backlog', 'todo', 'running', 'done', 'failed'] as const) {
+          if (typeof raw[key] === 'string' && raw[key].trim() !== '') {
+            statusMap[key] = raw[key].trim()
+          }
+        }
+        if (Object.keys(statusMap).length > 0) options.statusMap = statusMap
+      }
+
+      const edit = args.action === 'add'
+        ? addProject(current, input, options)
+        : args.action === 'remove'
+          ? removeProject(current, input)
+          : args.action === 'update'
+            ? updateProject(current, input, options)
+            : undefined
+      if (edit === undefined) return refused('unknown-action', 'action must be list, add, remove, update or discover')
+      if (!edit.ok) return refused(edit.code, edit.message)
+      try {
+        const projects = await setup.writeProjects(edit.projects)
+        return json({ ok: true, projects })
+      } catch (error) {
+        return refused(error instanceof GitHubSetupError ? error.code : 'write-failed', describeSetupError(error))
+      }
+    },
+  })
 }
 
 
@@ -279,15 +389,17 @@ function buildGetTool(service: GitHubSyncService): ToolDefinition {
 function buildRefreshTool(service: GitHubSyncService): ToolDefinition {
   return defineTool({
     name: 'task_board_github_refresh',
-    description: 'Trigger synchronization between GitHub issues/pull requests and the task board for a task, a repository, or all configured repositories.',
+    description: 'Trigger synchronization between GitHub issues/projects/pull requests and the task board for a task, a repository, a Project v2, or all configured targets.',
     parameters: {
       taskId: { type: 'string', description: 'Specific task ID to refresh.' },
-      owner: { type: 'string', description: 'Repository owner to refresh.' },
+      owner: { type: 'string', description: 'Repository or Project owner to refresh.' },
       repository: { type: 'string', description: 'Repository name to refresh.' },
+      projectNumber: { type: 'number', description: 'Project v2 number to refresh (used with owner and optional ownerType).' },
+      ownerType: { type: 'string', enum: ['organization', 'user'], description: 'Project owner kind (default: organization).' },
     },
     output: { schema: { type: 'json' }, render: renderJson },
     async execute(args) {
-      if (service.repositories.length === 0) {
+      if (service.repositories.length === 0 && service.projects.length === 0) {
         return refused('not-configured', 'GitHub integration is not configured')
       }
       try {
@@ -296,6 +408,10 @@ function buildRefreshTool(service: GitHubSyncService): ToolDefinition {
           if (!result.ok) return refused('sync-failed', result.error ?? 'sync failed')
           const updated = service.host.tasks.get(args.taskId.trim())
           return json({ ok: true, synced: 1, ...(updated === undefined ? {} : { task: githubTaskSummary(updated) }) })
+        } else if (typeof args.owner === 'string' && typeof args.projectNumber === 'number' && Number.isInteger(args.projectNumber) && args.projectNumber > 0) {
+          const ownerType = args.ownerType === 'user' ? 'user' : 'organization'
+          const result = await service.syncProject(ownerType, args.owner.trim(), args.projectNumber)
+          return json({ ok: true, synced: result.synced, ...(result.errors.length > 0 ? { errors: result.errors } : {}) })
         } else if (typeof args.owner === 'string' && typeof args.repository === 'string') {
           const result = await service.syncRepository(args.owner.trim(), args.repository.trim())
           return json({ ok: true, synced: result.synced, ...(result.errors.length > 0 ? { errors: result.errors } : {}) })
@@ -416,6 +532,93 @@ function buildLinkPrTool(service: GitHubSyncService): ToolDefinition {
         return json({ ok: true, pullRequest: pr })
       } catch (error) {
         return refused('link-pr-failed', error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+}
+
+const VALID_TASK_STATUSES = new Set<TaskStatus>(['backlog', 'todo', 'running', 'done', 'failed'])
+
+function buildCreateTaskTool(service: GitHubSyncService, setup: GitHubSetup): ToolDefinition {
+  return defineTool({
+    name: 'task_board_github_create',
+    description: 'Create a remote GitHub Issue, Project v2 Issue, or Project v2 DraftIssue and materialize it as a linked card on the task board.',
+    parameters: {
+      mode: { type: 'string', required: true, enum: ['issue', 'project-issue', 'project-draft'], description: 'Backend target: issue (repo issue only), project-issue (repo issue added to Project v2), or project-draft (DraftIssue inside Project v2).' },
+      title: { type: 'string', required: true, description: 'Task and remote item title.' },
+      description: { type: 'string', description: 'Remote issue or draft body in Markdown.' },
+      prompt: { type: 'string', description: 'Optional explicit execution prompt; defaults to the composed GitHub prompt.' },
+      repository: { type: 'string', description: 'Target repository (owner/repo or GitHub URL). Required for issue and project-issue modes.' },
+      project: { type: 'string', description: 'Target Project v2 (URL, org/<owner>/projects/<n>, user/<owner>/projects/<n>, <owner>/projects/<n>, or <owner>#<n>). Required for project-issue and project-draft modes.' },
+      labels: { type: 'array', items: { type: 'string' }, description: 'Optional GitHub issue labels.' },
+      assignee: { type: 'string', description: 'Optional GitHub login to assign (supports @me).' },
+      status: { type: 'string', enum: ['backlog', 'todo', 'running', 'done', 'failed'], description: 'Initial board column (and Project v2 Status when matched).' },
+    },
+    output: { schema: { type: 'json' }, render: renderJson },
+    async execute(args) {
+      const mode = args.mode as GitHubCreateBackendMode
+      if (mode !== 'issue' && mode !== 'project-issue' && mode !== 'project-draft') {
+        return refused('invalid-mode', 'mode must be issue, project-issue or project-draft')
+      }
+      if (typeof args.title !== 'string' || args.title.trim() === '') {
+        return refused('title-required', 'title is required')
+      }
+      const parsedRepo = typeof args.repository === 'string' && args.repository.trim() !== ''
+        ? parseRepositoryInput(args.repository)
+        : undefined
+      if ((mode === 'issue' || mode === 'project-issue') && parsedRepo === undefined) {
+        return refused('invalid-repository', 'repository (owner/repo) is required for issue and project-issue modes')
+      }
+      const parsedProject = typeof args.project === 'string' && args.project.trim() !== ''
+        ? parseProjectInput(args.project)
+        : undefined
+      if ((mode === 'project-issue' || mode === 'project-draft') && parsedProject === undefined) {
+        return refused('invalid-project', 'project (e.g. org:owner#1 or project URL) is required for project-issue and project-draft modes')
+      }
+
+      const status = typeof args.status === 'string' && VALID_TASK_STATUSES.has(args.status as TaskStatus)
+        ? (args.status as TaskStatus)
+        : undefined
+      const labels = Array.isArray(args.labels)
+        ? args.labels.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '').map(entry => entry.trim())
+        : undefined
+      const assignees = typeof args.assignee === 'string' && args.assignee.trim() !== ''
+        ? [args.assignee.trim()]
+        : undefined
+
+      try {
+        const result = await setup.createRemoteTask({
+          mode,
+          ...(parsedRepo !== undefined ? { owner: parsedRepo.owner, repository: parsedRepo.repository } : {}),
+          ...(parsedProject !== undefined
+            ? {
+                projectOwnerType: parsedProject.ownerType,
+                projectOwner: parsedProject.owner,
+                projectNumber: parsedProject.projectNumber,
+              }
+            : {}),
+          title: args.title.trim(),
+          ...(typeof args.description === 'string' ? { body: args.description } : {}),
+          ...(typeof args.prompt === 'string' ? { prompt: args.prompt } : {}),
+          ...(status !== undefined ? { status } : {}),
+          ...(labels !== undefined && labels.length > 0 ? { labels } : {}),
+          ...(assignees !== undefined ? { assignees } : {}),
+        })
+
+        const created = service.host.tasks.create(
+          {
+            title: result.title,
+            description: result.description,
+            prompt: result.prompt,
+            ...(result.status !== undefined ? { status: result.status } : {}),
+            ...(result.suggestedWorkspaceId !== undefined ? { workspaceId: result.suggestedWorkspaceId } : {}),
+          },
+          { payload: result.payload as unknown as Record<string, unknown> },
+        )
+        service.reindex()
+        return json({ ok: true, task: githubTaskSummary(created) })
+      } catch (error) {
+        return refused(error instanceof GitHubSetupError ? error.code : 'create-failed', describeSetupError(error))
       }
     },
   })

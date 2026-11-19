@@ -353,4 +353,46 @@ describe('GitHub UI integration', () => {
     expect(header?.getAttribute('aria-expanded')).toBe('true')
     expect(container.querySelector('#settings-task-board-github-enabled [aria-pressed="true"]')?.textContent).toBe(zh['settings.inherit'])
   })
+
+  it('operator sees Project v2 badge for draft items and Project row without PR buttons in detail', () => {
+    // Given a Project v2 DraftIssue card
+    const task = fakeTask({
+      integrations: {
+        github: {
+          provider: 'github',
+          owner: 'deepseek-ai',
+          repository: '',
+          issueNumber: 0,
+          issueUrl: 'https://github.com/orgs/deepseek-ai/projects/7',
+          remoteLabels: [],
+          project: {
+            projectId: 'PVT_1',
+            projectNumber: 7,
+            ownerType: 'organization',
+            owner: 'deepseek-ai',
+            projectTitle: 'Roadmap',
+            itemId: 'PVTI_1',
+            statusName: 'In Progress',
+            isDraft: true,
+          },
+        },
+      },
+    })
+
+    // When both the card decoration and detail section render
+    const badgeContainer = render(<GitHubCardDecoration task={task} />)
+    const detailContainer = render(<GitHubDetailSection task={task} dispatch={async () => true} />)
+
+    // Then the badge renders Project #7 linking to the project
+    const badge = badgeContainer.querySelector('[data-dsh-part="github-badge"]')
+    expect(badge?.textContent).toBe('Project #7')
+    expect(badge?.getAttribute('href')).toBe('https://github.com/orgs/deepseek-ai/projects/7')
+
+    // And the detail section shows the Project v2 row with status and hides Create/Link PR buttons
+    const projectRow = detailContainer.querySelector('[data-dsh-part="github-project"]')
+    expect(projectRow?.textContent).toContain('Roadmap')
+    expect(projectRow?.textContent).toContain('In Progress')
+    expect(detailContainer.textContent).not.toContain(zh['detail.createPr'])
+    expect(detailContainer.textContent).not.toContain(zh['detail.linkPr'])
+  })
 })

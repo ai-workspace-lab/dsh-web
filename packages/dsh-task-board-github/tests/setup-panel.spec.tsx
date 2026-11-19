@@ -7,9 +7,9 @@
  */
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { GitHubProxyStatus as GitHubProxySummary, GitHubSetupSummary } from '../src/core/setup.ts'
-import type { GitHubRepoConfig } from '../src/core/types.ts'
+import type { GitHubProjectConfig, GitHubRepoConfig } from '../src/core/types.ts'
 import { GitHubSetupPanel } from '../src/client/SetupPanel.tsx'
 import type { GitHubSetupApi } from '../src/client/setup-api.ts'
 import { t, zh } from '../src/client/locales.ts'
@@ -45,13 +45,18 @@ function resolveProxy(mode: GitHubProxySummary['mode'], url: string): GitHubProx
 }
 
 /** The setup API double: an in-memory configuration recording every call. */
-function apiDouble(initial: GitHubRepoConfig[] = []) {
+function apiDouble(initial: GitHubRepoConfig[] = [], initialProjects: GitHubProjectConfig[] = []) {
   const calls: string[] = []
   let repositories = [...initial]
+  let projects = [...initialProjects]
   let credential: GitHubSetupSummary['credential'] = { configured: false, writable: true, envName: 'GITHUB_TOKEN' }
   let proxy: GitHubSetupSummary['proxy'] = { mode: 'auto', url: '' }
+  let pollCount = 0
   const api: GitHubSetupApi = {
-    status: async () => { calls.push('status'); return { credential, repositories: [...repositories], running: true, settingsWritable: true, proxy } },
+    status: async () => {
+      calls.push('status')
+      return { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy }
+    },
     test: async () => {
       calls.push('test')
       return {
@@ -59,17 +64,25 @@ function apiDouble(initial: GitHubRepoConfig[] = []) {
         login: 'octocat',
         credential,
         checks: [{ owner: 'deepseek-ai', repository: 'dsh-web', ok: true, message: '3 open issues carry the "dsh" label' }],
+        projectChecks: projects.map(p => ({
+          ownerType: p.ownerType,
+          owner: p.owner,
+          projectNumber: p.projectNumber,
+          ok: true,
+          title: p.title ?? `Project #${String(p.projectNumber)}`,
+          message: '2 items',
+        })),
       }
     },
     setCredential: async (token) => {
       calls.push('setCredential ' + token)
       credential = { configured: true, writable: true, envName: 'GITHUB_TOKEN', source: 'store' }
-      return { credential, repositories: [...repositories], running: true, settingsWritable: true, proxy }
+      return { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy }
     },
     clearCredential: async () => {
       calls.push('clearCredential')
       credential = { configured: false, writable: true, envName: 'GITHUB_TOKEN' }
-      return { credential, repositories: [...repositories], running: true, settingsWritable: true, proxy }
+      return { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy }
     },
     listRepositories: async () => [...repositories],
     writeRepositories: async (value) => {
@@ -80,10 +93,87 @@ function apiDouble(initial: GitHubRepoConfig[] = []) {
     setProxy: async (value) => {
       calls.push('setProxy ' + value.mode + ' ' + value.url)
       proxy = resolveProxy(value.mode, value.url)
-      return { credential, repositories: [...repositories], running: true, settingsWritable: true, proxy }
+      return { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy }
+    },
+    startDeviceAuth: async () => {
+      calls.push('startDeviceAuth')
+      return {
+        flowId: 'flow-1',
+        userCode: 'WXYZ-1234',
+        verificationUri: 'https://github.com/login/device',
+        expiresIn: 900,
+        interval: 1,
+      }
+    },
+    pollDeviceAuth: async (flowId) => {
+      calls.push('pollDeviceAuth ' + flowId)
+      pollCount += 1
+      if (pollCount === 1) return { status: 'pending', interval: 1 }
+      credential = { configured: true, writable: true, envName: 'GITHUB_TOKEN', source: 'oauth' }
+      return {
+        status: 'authorized',
+        login: 'octocat',
+        scopes: ['repo', 'project'],
+        summary: { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy },
+      }
+    },
+    cancelDeviceAuth: async (flowId) => {
+      calls.push('cancelDeviceAuth ' + flowId)
+    },
+    importLocalAuth: async () => {
+      calls.push('importLocalAuth')
+      credential = { configured: true, writable: true, envName: 'GITHUB_TOKEN', source: 'gh-cli' }
+      return {
+        ok: true,
+        source: 'gh-cli',
+        login: 'octocat',
+        scopes: ['repo'],
+        summary: { credential, repositories: [...repositories], projects: [...projects], running: true, settingsWritable: true, proxy },
+      }
+    },
+    listProjects: async () => [...projects],
+    writeProjects: async (value) => {
+      calls.push('writeProjects')
+      projects = [...value]
+      return projects
+    },
+    discoverOrgs: async () => {
+      calls.push('discoverOrgs')
+      return {
+        login: 'octocat',
+        organizations: [{ login: 'deepseek-ai', name: 'DeepSeek' }],
+      }
+    },
+    discoverProjects: async (owner, ownerType) => {
+      calls.push(`discoverProjects ${ownerType ?? 'organization'}:${owner}`)
+      if (owner === 'deepseek-ai') {
+        return [{ id: 'P1', number: 7, title: 'Roadmap', url: 'https://github.com/orgs/deepseek-ai/projects/7', ownerType: 'organization', owner: 'deepseek-ai' }]
+      }
+      return []
+    },
+    discoverRepositories: async (owner) => {
+      calls.push(`discoverRepositories ${owner ?? 'user'}`)
+      if (owner === 'deepseek-ai') {
+        return [{ owner: 'deepseek-ai', name: 'dsh-web', fullName: 'deepseek-ai/dsh-web', private: false }]
+      }
+      return []
+    },
+    createRemoteTask: async () => {
+      throw new Error('unused')
+    },
+    triggerSync: async () => {
+      calls.push('triggerSync')
+      return { synced: 4, errors: [] }
     },
   }
-  return { api, calls, list: () => repositories, proxy: () => proxy, setProxyState: (next: GitHubSetupSummary['proxy']) => { proxy = next } }
+  return {
+    api,
+    calls,
+    list: () => repositories,
+    projectList: () => projects,
+    proxy: () => proxy,
+    setProxyState: (next: GitHubSetupSummary['proxy']) => { proxy = next },
+  }
 }
 
 /** Render the panel and let its first status read settle. */
@@ -468,6 +558,113 @@ describe('GitHub setup panel network proxy', () => {
     // stays away
     expect(proxyEffectiveLine(container).textContent).toBe(zh['setup.proxyDirectMode'])
     expect(proxyUrlInput(container)).toBeNull()
+  })
+
+  it('operator signs in with GitHub device flow and completes authorization', async () => {
+    // Given fake timers and a panel with no credential configured
+    vi.useFakeTimers()
+    try {
+      const double = apiDouble()
+      const container = await renderPanel(double.api)
+
+      // When the operator clicks Sign in with GitHub
+      const loginBtn = container.querySelector('[data-dsh-part="github-device-login"]') as HTMLButtonElement
+      await act(async () => { loginBtn.click() })
+
+      // Then the device flow banner shows the user code and verification link
+      const codeEl = container.querySelector('[data-dsh-part="github-device-code"]')
+      expect(codeEl?.textContent).toBe('WXYZ-1234')
+
+      // When polling advances twice (pending -> authorized)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1100) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1100) })
+
+      // Then the banner closes and the authenticated login is displayed
+      expect(container.querySelector('[data-dsh-part="github-device-flow"]')).toBeNull()
+      expect(container.textContent).toContain('octocat')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('operator imports local login and sees missing project scope warning', async () => {
+    // Given a panel whose host has a local gh-cli token lacking project scope
+    const double = apiDouble()
+    const container = await renderPanel(double.api)
+
+    // When the operator clicks Import local login
+    const importBtn = container.querySelector('[data-dsh-part="github-local-login"]') as HTMLButtonElement
+    await act(async () => { importBtn.click() })
+
+    // Then the imported login, source, and missing-scope warning appear
+    expect(double.calls).toContain('importLocalAuth')
+    expect(container.textContent).toContain('octocat')
+    expect(container.textContent).toContain('gh-cli')
+    expect(container.textContent).toContain(zh['setup.localLoginMissingScope'])
+  })
+
+  it('operator triggers manual sync and reloads status', async () => {
+    // Given a mounted panel
+    const double = apiDouble()
+    const container = await renderPanel(double.api)
+
+    // When the operator clicks Sync now
+    const syncBtn = container.querySelector('[data-dsh-part="github-sync-now"]') as HTMLButtonElement
+    await act(async () => { syncBtn.click() })
+
+    // Then triggerSync is called and the sync count is shown
+    expect(double.calls).toContain('triggerSync')
+    expect(container.textContent).toContain('4')
+  })
+
+  it('operator adds, toggles drafts on, and removes an Org Project v2', async () => {
+    // Given a panel with no projects configured
+    const double = apiDouble()
+    const container = await renderPanel(double.api)
+
+    // When the operator expands the Projects disclosure and adds deepseek-ai/projects/3
+    const toggle = container.querySelector('[data-dsh-part="github-projects"] button') as HTMLButtonElement
+    await act(async () => { toggle.click() })
+    const input = container.querySelector('[data-dsh-part="github-project-input"]') as HTMLInputElement
+    const addBtn = container.querySelector('[data-dsh-part="github-project-add"]') as HTMLButtonElement
+    await act(async () => { type(input, 'deepseek-ai/projects/3') })
+    await act(async () => { addBtn.click() })
+
+    // Then the project is saved and rendered
+    expect(double.projectList()).toHaveLength(1)
+    expect(double.projectList()[0]!.projectNumber).toBe(3)
+
+    // When the operator toggles Drafts off and then removes the project
+    const draftsBtn = container.querySelector('[data-dsh-part="github-project-drafts-toggle"]') as HTMLButtonElement
+    await act(async () => { draftsBtn.click() })
+    expect(double.projectList()[0]!.includeDrafts).toBe(false)
+
+    const removeBtn = container.querySelector('[data-dsh-part="github-project-remove"]') as HTMLButtonElement
+    await act(async () => { removeBtn.click() })
+
+    // Then the project list is empty again
+    expect(double.projectList()).toHaveLength(0)
+  })
+
+  it('operator browses organizations and syncs a discovered project and repository', async () => {
+    // Given a panel with discovery support
+    const double = apiDouble()
+    const container = await renderPanel(double.api)
+
+    // When the operator clicks Load organizations and selects deepseek-ai
+    const loadBtn = container.querySelector('[data-dsh-part="github-discover-load"]') as HTMLButtonElement
+    await act(async () => { loadBtn.click() })
+    const ownerButtons = [...container.querySelectorAll('[data-dsh-part="github-discover-owner"]')] as HTMLButtonElement[]
+    const orgBtn = ownerButtons.find(btn => btn.textContent === 'deepseek-ai')!
+    await act(async () => { orgBtn.click() })
+
+    // Then discovered projects and repositories render and 1-click Sync writes them
+    const projSyncBtn = container.querySelector('[data-dsh-part="github-discover-project"] button') as HTMLButtonElement
+    const repoSyncBtn = container.querySelector('[data-dsh-part="github-discover-repo"] button') as HTMLButtonElement
+    await act(async () => { projSyncBtn.click() })
+    await act(async () => { repoSyncBtn.click() })
+    expect(double.projectList()).toHaveLength(1)
+    expect(double.list()).toHaveLength(1)
   })
 })
 

@@ -25,12 +25,28 @@ interface CredentialInfo {
   writable: boolean
 }
 
+export const CONNECTORS_GITHUB_CREDENTIAL_KEY = 'connectors/github'
+
 /** The slice of the credential seam this extension uses. */
 export interface CredentialFace {
   resolve(ref: unknown): Promise<{ value: string; source?: string } | undefined>
   describe(ref: unknown): Promise<CredentialInfo>
   set(ref: unknown, value: string): Promise<void>
   unset(ref: unknown): Promise<void>
+  readRecord?(key: unknown): Promise<unknown>
+  describeRecord?(key: unknown): Promise<{ configured?: boolean; kind?: string; writable?: boolean }>
+}
+
+function extractConnectorRecordToken(record: unknown): string | undefined {
+  if (typeof record !== 'object' || record === null) return undefined
+  const obj = record as Record<string, unknown>
+  const payload = obj.payload
+  if (typeof payload === 'object' && payload !== null) {
+    const token = (payload as Record<string, unknown>).accessToken
+    if (typeof token === 'string' && token.trim() !== '') return token.trim()
+  }
+  if (typeof obj.key === 'string' && obj.key.trim() !== '') return obj.key.trim()
+  return undefined
 }
 
 /**
@@ -81,6 +97,31 @@ export async function describeGitHubCredential(
   if (info !== undefined && info.configured) {
     return { configured: true, writable: info.writable, envName, ...(info.source === undefined ? {} : { source: info.source }) }
   }
+  if (face !== undefined) {
+    let connectorConfigured = false
+    if (typeof face.describeRecord === 'function') {
+      try {
+        const recordInfo = await face.describeRecord(CONNECTORS_GITHUB_CREDENTIAL_KEY)
+        connectorConfigured = recordInfo?.configured === true
+      } catch {
+        connectorConfigured = false
+      }
+    } else if (typeof face.readRecord === 'function') {
+      try {
+        connectorConfigured = extractConnectorRecordToken(await face.readRecord(CONNECTORS_GITHUB_CREDENTIAL_KEY)) !== undefined
+      } catch {
+        connectorConfigured = false
+      }
+    }
+    if (connectorConfigured) {
+      return {
+        configured: true,
+        writable: info?.writable ?? true,
+        envName,
+        source: 'dsh-connectors',
+      }
+    }
+  }
   if (ambient !== undefined) {
     return {
       configured: true,
@@ -111,7 +152,15 @@ export async function resolveGitHubToken(
       const resolved = await face.resolve(credentialRef(envName))
       if (resolved?.value !== undefined && resolved.value.trim() !== '') return resolved.value.trim()
     } catch {
-      // An unreadable store falls through to the environment.
+      // An unreadable store falls through to connectors or the environment.
+    }
+  }
+  if (face !== undefined && typeof face.readRecord === 'function') {
+    try {
+      const recordToken = extractConnectorRecordToken(await face.readRecord(CONNECTORS_GITHUB_CREDENTIAL_KEY))
+      if (recordToken !== undefined) return recordToken
+    } catch {
+      // Fall through to the ambient environment.
     }
   }
   return ambientToken(env, envName)

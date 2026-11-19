@@ -31,12 +31,15 @@ export const TASK_BOARD_DETAIL_SECTION = 'task-board.detail.section'
 export const TASK_BOARD_SETTINGS_SECTION = 'task-board.settings.section'
 /** Child seat a provider registers its card decoration into. */
 export const TASK_BOARD_CARD_DECORATION = 'task-board.card.decoration'
+/** Child seat a provider registers its task-creation backend section into. */
+export const TASK_BOARD_CREATE_SECTION = 'task-board.create.section'
 
 /** Every child seat the board declares for extensions, in render order. */
 export const TASK_BOARD_EXTENSION_SEATS: readonly string[] = [
   TASK_BOARD_DETAIL_SECTION,
   TASK_BOARD_SETTINGS_SECTION,
   TASK_BOARD_CARD_DECORATION,
+  TASK_BOARD_CREATE_SECTION,
 ]
 
 /**
@@ -410,6 +413,42 @@ export interface TaskBoardSettingsSectionProps {
 /** Owner props of the card-decoration seat. */
 export interface TaskBoardCardDecorationProps {
   task: TaskRecord
+}
+
+/** Draft handed to an external creation backend when preparing a task. */
+export interface TaskBoardCreateBackendDraft {
+  title: string
+  description: string
+  prompt: string
+  tags: readonly string[]
+  workspaceId?: string
+}
+
+/** Result returned by an external creation backend after creating/linking the remote item. */
+export interface TaskBoardCreateBackendResult {
+  payload: TaskBoardExtensionPayload
+  prompt?: string
+  workspaceId?: string
+}
+
+/** Selected external creation backend for the new-task modal. */
+export interface TaskBoardCreateBackendSelection {
+  extensionId: string
+  label: string
+  prepareCreate: (draft: TaskBoardCreateBackendDraft) => Promise<TaskBoardCreateBackendResult>
+}
+
+/** Owner props of the create-section seat. */
+export interface TaskBoardCreateSectionProps {
+  title: string
+  description: string
+  prompt: string
+  tags: readonly string[]
+  workspaceId: string
+  pending: boolean
+  selected: TaskBoardCreateBackendSelection | undefined
+  onSelect: (backend: TaskBoardCreateBackendSelection | undefined) => void
+  dispatch: TaskBoardExtensionDispatch
 }
 
 /**

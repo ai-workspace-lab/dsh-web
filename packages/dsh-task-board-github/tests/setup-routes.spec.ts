@@ -15,7 +15,7 @@ import type { GitHubSetup } from '../src/host/setup.ts'
 
 const credential: GitHubCredentialStatus = { configured: false, writable: true, envName: 'GITHUB_TOKEN' }
 const proxy: GitHubSetupSummary['proxy'] = { mode: 'auto', url: '' }
-const summary: GitHubSetupSummary = { credential, repositories: [], running: true, settingsWritable: true, proxy }
+const summary: GitHubSetupSummary = { credential, repositories: [], projects: [], running: true, settingsWritable: true, proxy }
 
 /** A setup surface double recording every operation the routes reach. */
 function recordingSetup() {
@@ -28,8 +28,47 @@ function recordingSetup() {
     },
     setCredential: async token => { calls.push('setCredential ' + token); return summary },
     clearCredential: async () => { calls.push('clearCredential'); return summary },
+    startDeviceAuth: async () => {
+      calls.push('startDeviceAuth')
+      return { flowId: 'flow-1', userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', expiresIn: 900, interval: 5 }
+    },
+    pollDeviceAuth: async (flowId) => {
+      calls.push('pollDeviceAuth ' + flowId)
+      return { status: 'pending', interval: 5 }
+    },
+    cancelDeviceAuth: (flowId) => {
+      calls.push('cancelDeviceAuth ' + flowId)
+      return true
+    },
+    importLocalAuth: async () => {
+      calls.push('importLocalAuth')
+      return { ok: true, source: 'gh-cli', login: 'octocat', summary }
+    },
     listRepositories: () => { calls.push('listRepositories'); return [] },
     writeRepositories: async (value) => { calls.push('writeRepositories ' + JSON.stringify(value)); return value as never },
+    listProjects: () => { calls.push('listProjects'); return [] },
+    writeProjects: async (value) => { calls.push('writeProjects ' + JSON.stringify(value)); return value as never },
+    discoverOrgs: async () => { calls.push('discoverOrgs'); return [{ login: 'deepseek-ai' }] },
+    discoverProjects: async () => { calls.push('discoverProjects'); return [] },
+    discoverRepositories: async () => { calls.push('discoverRepositories'); return [] },
+    createRemoteTask: async (input) => {
+      calls.push('createRemoteTask ' + input.mode)
+      return {
+        title: input.title,
+        description: input.body ?? '',
+        prompt: input.prompt ?? input.title,
+        suggestedPrompt: input.title,
+        payload: {
+          provider: 'github',
+          owner: 'deepseek-ai',
+          repository: 'dsh',
+          issueNumber: 1,
+          issueUrl: 'https://github.com/deepseek-ai/dsh/issues/1',
+          remoteLabels: [],
+        },
+      }
+    },
+    triggerSync: async () => { calls.push('triggerSync'); return { ok: true } },
     credential: async () => credential,
     proxy: () => { calls.push('proxy'); return proxy },
     setProxy: async (value) => { calls.push('setProxy ' + JSON.stringify(value)); return summary },
@@ -91,6 +130,16 @@ describe('GitHub setup route addressing', () => {
       '/api/task-board-github/credential',
       '/api/task-board-github/repositories',
       '/api/task-board-github/proxy',
+      '/api/task-board-github/auth/device/start',
+      '/api/task-board-github/auth/device/poll',
+      '/api/task-board-github/auth/device/cancel',
+      '/api/task-board-github/auth/import-local',
+      '/api/task-board-github/projects',
+      '/api/task-board-github/discover/orgs',
+      '/api/task-board-github/discover/projects',
+      '/api/task-board-github/discover/repositories',
+      '/api/task-board-github/tasks/create-remote',
+      '/api/task-board-github/sync',
     ])
   })
 
@@ -232,5 +281,52 @@ describe('GitHub setup routes', () => {
     expect(out.state.status).toBe(200)
     expect(out.json().report).toMatchObject({ login: 'octocat' })
     expect(calls).toEqual(['test deepseek-ai'])
+  })
+
+  it('operator routes device auth, projects, discovery, remote task creation, and sync over loopback only', async () => {
+    // Given the extended setup routes
+    const { setup, calls } = recordingSetup()
+    const routes = makeGitHubSetupRoutes(setup)
+
+    // When calling each new route from loopback and once from non-loopback
+    const nonLoopback = await call(routes, '/auth/device/start', request({ method: 'POST', address: '192.168.1.50', body: {} }))
+    const started = await call(routes, '/auth/device/start', request({ method: 'POST', body: {} }))
+    const polled = await call(routes, '/auth/device/poll', request({ method: 'POST', body: { flowId: 'flow-1' } }))
+    const cancelled = await call(routes, '/auth/device/cancel', request({ method: 'POST', body: { flowId: 'flow-1' } }))
+    const imported = await call(routes, '/auth/import-local', request({ method: 'POST', body: {} }))
+    const projectsGet = await call(routes, '/projects', request({ method: 'GET' }))
+    const projectsPut = await call(routes, '/projects', request({ method: 'PUT', body: { projects: [] } }))
+    const orgs = await call(routes, '/discover/orgs', request({ method: 'GET' }))
+    const discProjects = await call(routes, '/discover/projects', request({ method: 'GET' }))
+    const discRepos = await call(routes, '/discover/repositories', request({ method: 'GET' }))
+    const created = await call(routes, '/tasks/create-remote', request({ method: 'POST', body: { mode: 'issue', title: 'New' } }))
+    const synced = await call(routes, '/sync', request({ method: 'POST', body: {} }))
+
+    // Then non-loopback is forbidden and all loopback routes delegate cleanly
+    expect(nonLoopback.state.status).toBe(403)
+    expect(started.state.status).toBe(200)
+    expect(polled.state.status).toBe(200)
+    expect(cancelled.state.status).toBe(200)
+    expect(imported.state.status).toBe(200)
+    expect(projectsGet.state.status).toBe(200)
+    expect(projectsPut.state.status).toBe(200)
+    expect(orgs.state.status).toBe(200)
+    expect(discProjects.state.status).toBe(200)
+    expect(discRepos.state.status).toBe(200)
+    expect(created.state.status).toBe(200)
+    expect(synced.state.status).toBe(200)
+    expect(calls).toEqual([
+      'startDeviceAuth',
+      'pollDeviceAuth flow-1',
+      'cancelDeviceAuth flow-1',
+      'importLocalAuth',
+      'listProjects',
+      'writeProjects []',
+      'discoverOrgs',
+      'discoverProjects',
+      'discoverRepositories',
+      'createRemoteTask issue',
+      'triggerSync',
+    ])
   })
 })

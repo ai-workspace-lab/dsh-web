@@ -20,12 +20,20 @@ import {
   fingerprint,
   isPromptEdited,
   issueSourceHash,
+  neutralizeDelimiters,
 } from './prompt.ts'
 import {
   readTaskGitHubMetadata,
+  resolveRepoConfig,
   type GitHubIssuePayload,
+  type GitHubProjectDetailPayload,
+  type GitHubProjectItemMetadata,
+  type GitHubProjectItemPayload,
+  type GitHubProjectStatusMap,
+  type GitHubProjectStatusOption,
   type GitHubPromptAnalysis,
   type GitHubRemoteCloseSync,
+  type ResolvedGitHubProjectConfig,
   type ResolvedGitHubRepoConfig,
 } from './types.ts'
 
@@ -367,6 +375,194 @@ export function materializeTaskFromIssue(
         lastSyncedAt: now,
         lastRemoteUpdatedAt: Number.isFinite(remoteUpdatedAt) ? remoteUpdatedAt : undefined,
         promptHash,
+      },
+    },
+  }
+}
+
+/** Map a Project v2 Status option name onto a local board column. */
+export function resolveStatusFromProjectOption(
+  optionName: string | undefined,
+  statusMap: Required<GitHubProjectStatusMap>,
+): TaskStatus {
+  const normalized = (optionName ?? '').trim().toLowerCase()
+  if (normalized === '') return 'todo'
+  for (const status of ['failed', 'done', 'running', 'backlog', 'todo'] as const) {
+    if (statusMap[status].trim().toLowerCase() === normalized) return status
+  }
+  return 'todo'
+}
+
+/** Find the Project v2 Status option matching a target board column. */
+export function resolveProjectOptionForStatus(
+  targetStatus: TaskStatus,
+  options: readonly GitHubProjectStatusOption[],
+  statusMap: Required<GitHubProjectStatusMap>,
+): GitHubProjectStatusOption | undefined {
+  const wanted = statusMap[targetStatus].trim().toLowerCase()
+  if (wanted === '') return undefined
+  return options.find(option => option.name.trim().toLowerCase() === wanted)
+}
+
+function composeDraftPrompt(
+  item: { title: string; body?: string; url: string },
+  project: Pick<GitHubProjectDetailPayload, 'number' | 'title' | 'owner'>,
+): { prompt: string; promptHash: string } {
+  const safeTitle = neutralizeDelimiters(item.title.trim())
+  const safeBody = neutralizeDelimiters((item.body ?? '').trim())
+  const lines = [
+    `GitHub Project #${String(project.number)} (${project.owner}: ${project.title}) Draft Item`,
+    `URL: ${item.url}`,
+    `Title: ${safeTitle}`,
+  ]
+  if (safeBody !== '') {
+    lines.push('', 'Details:', safeBody)
+  }
+  const prompt = lines.join('\n')
+  return { prompt, promptHash: fingerprint(prompt) }
+}
+
+function buildProjectItemMetadata(
+  item: GitHubProjectItemPayload,
+  project: Pick<GitHubProjectDetailPayload, 'id' | 'number' | 'title' | 'ownerType' | 'owner' | 'statusFieldId'>,
+): GitHubProjectItemMetadata {
+  return {
+    projectId: project.id,
+    projectNumber: project.number,
+    ownerType: project.ownerType,
+    owner: project.owner,
+    projectTitle: project.title,
+    itemId: item.itemId,
+    ...(project.statusFieldId !== undefined ? { statusFieldId: project.statusFieldId } : {}),
+    ...(item.statusOptionId !== undefined ? { statusOptionId: item.statusOptionId } : {}),
+    ...(item.statusName !== undefined ? { statusName: item.statusName } : {}),
+    ...(item.isDraft ? { isDraft: true } : {}),
+    ...(item.draftIssueId !== undefined ? { draftIssueId: item.draftIssueId } : {}),
+  }
+}
+
+/** Materialize a brand-new TaskRecord from a GitHub Project v2 item (Issue or DraftIssue). */
+export function materializeTaskFromProjectItem(
+  item: GitHubProjectItemPayload,
+  project: Pick<GitHubProjectDetailPayload, 'id' | 'number' | 'title' | 'ownerType' | 'owner' | 'statusFieldId'>,
+  id: string,
+  now: number,
+  config: ResolvedGitHubProjectConfig,
+  repoConfig?: ResolvedGitHubRepoConfig,
+): TaskRecord {
+  const remoteTitle = item.title.trim()
+  const remoteBody = (item.body ?? '').trim()
+  const remoteLabels = [...(item.labels ?? [])]
+  const remoteUpdatedAt = item.updatedAt !== undefined ? Date.parse(item.updatedAt) : Number.NaN
+
+  const isDraft = item.isDraft === true
+  const owner = isDraft ? project.owner : (item.owner ?? project.owner)
+  const repository = isDraft ? '' : (item.repository ?? '')
+  const issueNumber = isDraft ? 0 : (item.issueNumber ?? 0)
+
+  const generated = isDraft
+    ? composeDraftPrompt({ title: remoteTitle, body: remoteBody, url: item.url }, project)
+    : composeIssuePrompt(
+        { number: issueNumber, html_url: item.url, title: remoteTitle, body: remoteBody, labels: remoteLabels },
+        repoConfig ?? resolveRepoConfig({ owner, repository }),
+      )
+
+  const status: TaskStatus = !isDraft && item.state === 'closed'
+    ? 'done'
+    : resolveStatusFromProjectOption(item.statusName, config.statusMap)
+
+  return {
+    id,
+    title: remoteTitle,
+    description: remoteBody,
+    prompt: generated.prompt,
+    status,
+    createdAt: now,
+    updatedAt: now,
+    executions: [],
+    integrations: {
+      github: {
+        provider: 'github',
+        owner,
+        repository,
+        issueNumber,
+        ...(item.issueNodeId !== undefined ? { issueNodeId: item.issueNodeId } : {}),
+        issueUrl: item.url,
+        remoteTitle,
+        remoteBody,
+        ...(!isDraft && item.state !== undefined ? { remoteState: item.state } : {}),
+        ...(!isDraft && item.state === 'closed' ? { remoteClose: { state: 'auto-done' as const } } : {}),
+        remoteLabels,
+        lastSyncedAt: now,
+        ...(Number.isFinite(remoteUpdatedAt) ? { lastRemoteUpdatedAt: remoteUpdatedAt } : {}),
+        promptHash: generated.promptHash,
+        project: buildProjectItemMetadata(item, project),
+      },
+    },
+  }
+}
+
+/** Reconcile a GitHub Project v2 item (Issue or DraftIssue) with an existing local TaskRecord. */
+export function reconcileProjectItemWithTask(
+  existing: TaskRecord,
+  item: GitHubProjectItemPayload,
+  project: Pick<GitHubProjectDetailPayload, 'id' | 'number' | 'title' | 'ownerType' | 'owner' | 'statusFieldId'>,
+  now: number,
+  _config: ResolvedGitHubProjectConfig,
+  repoConfig?: ResolvedGitHubRepoConfig,
+): TaskRecord {
+  const remoteTitle = item.title.trim()
+  const remoteBody = (item.body ?? '').trim()
+  const remoteLabels = [...(item.labels ?? [])]
+  const remoteUpdatedAt = item.updatedAt !== undefined ? Date.parse(item.updatedAt) : Number.NaN
+
+  const previous = readTaskGitHubMetadata(existing)
+  const edited = isPromptEdited(existing.prompt, previous?.promptHash, {
+    ...(previous?.remoteTitle === undefined ? {} : { title: previous.remoteTitle }),
+    ...(previous?.remoteBody === undefined ? {} : { body: previous.remoteBody }),
+  })
+
+  const isDraft = item.isDraft === true
+  const owner = isDraft ? project.owner : (item.owner ?? previous?.owner ?? project.owner)
+  const repository = isDraft ? '' : (item.repository ?? previous?.repository ?? '')
+  const issueNumber = isDraft ? 0 : (item.issueNumber ?? previous?.issueNumber ?? 0)
+
+  const generated = isDraft
+    ? composeDraftPrompt({ title: remoteTitle, body: remoteBody, url: item.url }, project)
+    : composeIssuePrompt(
+        { number: issueNumber, html_url: item.url, title: remoteTitle, body: remoteBody, labels: remoteLabels },
+        repoConfig ?? resolveRepoConfig({ owner, repository }),
+        previous?.analysis,
+      )
+
+  return {
+    ...existing,
+    title: remoteTitle,
+    description: remoteBody,
+    prompt: edited ? existing.prompt : generated.prompt,
+    updatedAt: now,
+    integrations: {
+      ...existing.integrations,
+      github: {
+        provider: 'github',
+        owner,
+        repository,
+        issueNumber,
+        ...(item.issueNodeId !== undefined ? { issueNodeId: item.issueNodeId } : {}),
+        issueUrl: item.url,
+        remoteTitle,
+        remoteBody,
+        ...(!isDraft && item.state !== undefined ? { remoteState: item.state } : {}),
+        ...(previous?.remoteClose !== undefined ? { remoteClose: previous.remoteClose } : {}),
+        remoteLabels,
+        lastSyncedAt: now,
+        ...(Number.isFinite(remoteUpdatedAt) ? { lastRemoteUpdatedAt: remoteUpdatedAt } : {}),
+        lastSyncError: undefined,
+        ...(previous?.pullRequest !== undefined ? { pullRequest: previous.pullRequest } : {}),
+        deactivated: undefined,
+        promptHash: edited ? undefined : generated.promptHash,
+        ...(previous?.analysis !== undefined ? { analysis: previous.analysis } : {}),
+        project: buildProjectItemMetadata(item, project),
       },
     },
   }

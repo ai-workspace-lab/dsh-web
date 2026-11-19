@@ -12,7 +12,7 @@
  * @module dsh-task-board-github/client/github/summary
  */
 import { useSyncExternalStore } from 'react'
-import { GITHUB_EXTENSION_ID } from '../../core/types.ts'
+import { GITHUB_EXTENSION_ID, type GitHubProjectOwnerType } from '../../core/types.ts'
 
 /** One configured repository, as the provider publishes it. */
 export interface GitHubRepositorySummary {
@@ -23,11 +23,22 @@ export interface GitHubRepositorySummary {
   hasCredential: boolean
 }
 
+/** One configured Project v2, as the provider publishes it. */
+export interface GitHubProjectSummary {
+  ownerType: GitHubProjectOwnerType
+  owner: string
+  projectNumber: number
+  title?: string
+  defaultRepository?: string
+  includeDrafts?: boolean
+}
+
 /** The provider's read-only summary; every field is optional on the wire. */
 export interface GitHubSummary {
   enabled?: boolean
   hasCredential?: boolean
   repositories?: GitHubRepositorySummary[]
+  projects?: GitHubProjectSummary[]
 }
 
 /** Normalize whatever the board hands back; a foreign payload reads as absent. */
@@ -48,10 +59,27 @@ function decode(value: unknown): GitHubSummary | undefined {
         }]
       })
     : undefined
+  const projects = Array.isArray(record.projects)
+    ? record.projects.flatMap(entry => {
+        if (typeof entry !== 'object' || entry === null) return []
+        const project = entry as Record<string, unknown>
+        if (typeof project.owner !== 'string' || typeof project.projectNumber !== 'number') return []
+        const ownerType: GitHubProjectOwnerType = project.ownerType === 'user' ? 'user' : 'organization'
+        return [{
+          ownerType,
+          owner: project.owner,
+          projectNumber: project.projectNumber,
+          ...(typeof project.title === 'string' && project.title !== '' ? { title: project.title } : {}),
+          ...(typeof project.defaultRepository === 'string' && project.defaultRepository !== '' ? { defaultRepository: project.defaultRepository } : {}),
+          ...(typeof project.includeDrafts === 'boolean' ? { includeDrafts: project.includeDrafts } : {}),
+        }]
+      })
+    : undefined
   return {
     ...(typeof record.enabled === 'boolean' ? { enabled: record.enabled } : {}),
     ...(typeof record.hasCredential === 'boolean' ? { hasCredential: record.hasCredential } : {}),
     ...(repositories === undefined ? {} : { repositories }),
+    ...(projects === undefined ? {} : { projects }),
   }
 }
 

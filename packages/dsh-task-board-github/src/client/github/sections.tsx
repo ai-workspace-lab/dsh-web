@@ -16,7 +16,12 @@ import {
   type TaskBoardExtensionDispatch,
 } from '../../core/contract.ts'
 import type { TaskRecord } from '../../core/task-record.ts'
-import { GITHUB_EXTENSION_ID, readTaskGitHubMetadata, type GitHubTaskMetadata } from '../../core/types.ts'
+import {
+  GITHUB_EXTENSION_ID,
+  readTaskGitHubMetadata,
+  type GitHubProjectItemMetadata,
+  type GitHubTaskMetadata,
+} from '../../core/types.ts'
 import { formatHostTimestamp } from '../format-host-time.ts'
 import { t, type TaskBoardGithubKey } from '../locales.ts'
 import type { GitHubSummary } from './summary.ts'
@@ -235,27 +240,55 @@ export function GitHubDetailSection({ task, dispatch }: TaskBoardDetailSectionPr
     }
   }
 
+  const isDraftProjectItem = metadata.project?.isDraft === true
+  const projectHref = metadata.project !== undefined ? projectUrl(metadata.project) : undefined
+
   return (
     <section className={css.detailSection} data-dsh-part="github-integration">
       <h4>{t('detail.title')}</h4>
       {metadata.deactivated === true && (
         <p className={css.formError}>{t('detail.deactivated')}</p>
       )}
-      <div className={css.detailText} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-        <a
-          href={metadata.issueUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className={css.linkButton}
-          data-dsh-part="github-link"
-          title={metadata.issueUrl}
-        >
-          {metadata.owner}/{metadata.repository} #{metadata.issueNumber}
-        </a>
-        <span className={css.statusBadge} data-status={metadata.remoteState === 'closed' ? 'done' : 'todo'}>
-          {t(`detail.state.${metadata.remoteState ?? 'open'}` as TaskBoardGithubKey)}
-        </span>
-      </div>
+      {!isDraftProjectItem && (
+        <div className={css.detailText} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <a
+            href={metadata.issueUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={css.linkButton}
+            data-dsh-part="github-link"
+            title={metadata.issueUrl}
+          >
+            {metadata.owner}/{metadata.repository} #{metadata.issueNumber}
+          </a>
+          <span className={css.statusBadge} data-status={metadata.remoteState === 'closed' ? 'done' : 'todo'}>
+            {t(`detail.state.${metadata.remoteState ?? 'open'}` as TaskBoardGithubKey)}
+          </span>
+        </div>
+      )}
+
+      {metadata.project !== undefined && projectHref !== undefined && (
+        <div className={css.detailText} data-dsh-part="github-project" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <span>{t('detail.project')}:</span>
+          <a
+            href={projectHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={css.linkButton}
+            title={projectHref}
+          >
+            {metadata.project.owner} / {metadata.project.projectTitle && metadata.project.projectTitle !== ''
+              ? metadata.project.projectTitle
+              : t('detail.projectFallback', { number: String(metadata.project.projectNumber) })}
+          </a>
+          {metadata.project.statusName !== undefined && metadata.project.statusName !== '' && (
+            <span className={css.statusBadge}>{metadata.project.statusName}</span>
+          )}
+          {isDraftProjectItem && (
+            <span className={css.cardTag}>{t('detail.projectDraft')}</span>
+          )}
+        </div>
+      )}
 
       {metadata.remoteLabels.length > 0 && (
         <div className={css.cardTags} style={{ marginTop: '6px' }}>
@@ -300,7 +333,7 @@ export function GitHubDetailSection({ task, dispatch }: TaskBoardDetailSectionPr
         <button type="button" className={css.ghostButton} disabled={refreshing} onClick={() => { void handleRefresh() }}>
           {refreshing ? t('detail.refreshing') : t('detail.refresh')}
         </button>
-        {metadata.pullRequest === undefined && (
+        {metadata.pullRequest === undefined && !isDraftProjectItem && (
           <>
             <button type="button" className={css.ghostButton} disabled={refreshing} onClick={() => setShowCreatePr(true)}>
               {t('detail.createPr')}
@@ -324,6 +357,12 @@ export function GitHubDetailSection({ task, dispatch }: TaskBoardDetailSectionPr
   )
 }
 
+/** Canonical GitHub web URL for a Project v2 item's parent project. */
+function projectUrl(project: GitHubProjectItemMetadata): string {
+  const segment = project.ownerType === 'user' ? 'users' : 'orgs'
+  return `https://github.com/${segment}/${encodeURIComponent(project.owner)}/projects/${String(project.projectNumber)}`
+}
+
 /** Only an http(s) issue URL becomes a link; anything else stays plain text. */
 function safeIssueHref(value: string): string | undefined {
   try {
@@ -335,17 +374,43 @@ function safeIssueHref(value: string): string | undefined {
 }
 
 /**
- * The card-decoration seat: a compact issue reference on linked cards. It
- * renders as an inline chip in the card's meta row and links to the issue in a
- * new tab; the board ignores clicks that land on a link, so following the
- * issue never also opens the task detail.
+ * The card-decoration seat: a compact issue or Project v2 reference on linked
+ * cards. It renders as an inline chip in the card's meta row and links to the
+ * issue or project in a new tab; the board ignores clicks that land on a link,
+ * so following it never also opens the task detail.
  */
 export function GitHubCardDecoration({ task }: { task: TaskRecord }) {
   const metadata = readTaskGitHubMetadata(task)
   if (metadata === undefined) return null
+  if (metadata.project?.isDraft === true) {
+    const label = `Project #${String(metadata.project.projectNumber)}`
+    const title = metadata.project.projectTitle !== undefined && metadata.project.projectTitle !== ''
+      ? `${metadata.project.owner} / ${metadata.project.projectTitle}`
+      : label
+    const href = safeIssueHref(projectUrl(metadata.project))
+    if (href === undefined) {
+      return <span className={css.cardSchedule} data-dsh-part="github-badge" title={title}>{label}</span>
+    }
+    return (
+      <a
+        className={`${css.cardSchedule} ${css.cardLink}`}
+        data-dsh-part="github-badge"
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={title}
+      >
+        {label}
+      </a>
+    )
+  }
   const reference = `${metadata.owner}/${metadata.repository}#${String(metadata.issueNumber)}`
   const href = safeIssueHref(metadata.issueUrl)
   const label = `#${String(metadata.issueNumber)}`
+  const baseTitle = t('card.openIssue', { reference })
+  const title = metadata.project?.projectTitle !== undefined && metadata.project.projectTitle !== ''
+    ? `${baseTitle} · ${metadata.project.projectTitle}`
+    : baseTitle
   if (href === undefined) {
     return <span className={css.cardSchedule} data-dsh-part="github-badge" title={reference}>{label}</span>
   }
@@ -356,7 +421,7 @@ export function GitHubCardDecoration({ task }: { task: TaskRecord }) {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      title={t('card.openIssue', { reference })}
+      title={title}
     >
       {label}
     </a>
